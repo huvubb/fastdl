@@ -6,7 +6,7 @@ import os
 import sys
 
 from . import __version__
-from .config import load_config
+from .config import load_config, save_config
 from .utils import human_bytes
 
 
@@ -28,9 +28,28 @@ def _cmd_hash(args) -> int:
     return 0
 
 
+def _parse_headers(args) -> dict | None:
+    """汇总 --header/--cookie/--referer/--ua 成请求头 dict；全空则 None。"""
+    out: dict[str, str] = {}
+    for h in (args.header or []):
+        if ":" in h:
+            k, _, v = h.partition(":")
+            out[k.strip()] = v.strip()
+        else:
+            raise ValueError(f"--header 格式应为 KEY:VALUE，收到: {h}")
+    if args.cookie:
+        out["Cookie"] = args.cookie
+    if args.referer:
+        out["Referer"] = args.referer
+    if args.ua:
+        out["User-Agent"] = args.ua
+    return out or None
+
+
 def _cmd_direct(args) -> int:
     from .direct import download
     from .config import load_config
+    from .utils import parse_limit
 
     cfg = load_config()
     threads = args.threads or cfg.threads
@@ -50,6 +69,9 @@ def _cmd_direct(args) -> int:
         engine=args.engine,
         timeout=args.timeout,
         stop=stop,
+        headers=_parse_headers(args),
+        proxy=args.proxy,
+        limit_bps=parse_limit(args.limit),
     )
     return rc
 
@@ -168,6 +190,14 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--engine", choices=["native", "aria2"], default="native",
                    help="直链引擎（aria2 需已安装 aria2c）")
     d.add_argument("--timeout", type=int, default=30)
+    d.add_argument("--header", action="append", default=None, metavar="KEY:VALUE",
+                   help="自定义请求头（可多次），如 --header 'Referer: https://x'")
+    d.add_argument("--cookie", default=None, help="Cookie 请求头")
+    d.add_argument("--referer", default=None, help="Referer 请求头")
+    d.add_argument("--ua", "--user-agent", default=None, help="自定义 User-Agent")
+    d.add_argument("--proxy", default=None,
+                   help="代理地址，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+    d.add_argument("--limit", default=None, help="下载限速，如 5M / 512K（不限速省略）")
     d.set_defaults(func=_cmd_direct)
 
     s = sub.add_parser("servers", help="管理/测试 eD2k 服务器")
@@ -189,7 +219,81 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _download_link(link: str, dest_dir: str, cfg) -> int:
+    """按链接类型分发下载。返回：0 完成，1 部分/可续传，2 失败。"""
+    low = link.lower()
+    if low.startswith("ed2k://"):
+        from .ed2k.link import parse_ed2k_link
+        from .ed2k.sources import SourceFetcher
+        from .ed2k.transfer import Ed2kDownloader
+
+        parsed = parse_ed2k_link(link)
+        servers = list(cfg.servers)
+        if not servers and os.path.exists(_default_server_file()):
+            servers = parse_server_file(_default_server_file())
+        fetcher = SourceFetcher(servers, cfg, parallel=8)
+        dl = Ed2kDownloader(parsed, dest_dir=dest_dir, fetcher=fetcher,
+                            max_sources=cfg.max_sources)
+        return dl.run()
+    if low.startswith(("http://", "https://", "ftp://")):
+        from .direct import download
+        return download(link, dest_dir=dest_dir, threads=cfg.threads)
+    raise ValueError(f"无法识别的链接类型: {link[:60]}")
+
+
+def _interactive(cfg) -> int:
+    """无参数启动：交互模式，粘贴链接即下载，自动识别直链/ed2k。"""
+    print("=" * 52)
+    print(f"  fastdl {__version__} —— 多线程直链 + ed2k 下载器")
+    print("  不用记参数：粘贴链接即可下载，可一次粘贴多个（每行一个）")
+    print("=" * 52)
+
+    default_dir = cfg.download_dir or os.path.join(os.getcwd(), "downloads")
+    try:
+        ans = input(f"\n下载目录 [默认: {default_dir}，直接回车使用]：").strip()
+    except EOFError:
+        return 0
+    dest_dir = ans or default_dir
+    if dest_dir != cfg.download_dir:
+        cfg.download_dir = dest_dir
+        save_config(cfg)
+    os.makedirs(dest_dir, exist_ok=True)
+    print(f"下载到: {dest_dir}\n")
+
+    print("请输入下载链接（http/https/ftp 直链 或 ed2k://；可一次粘贴多个，每行一个；输入 q 退出）")
+    while True:
+        try:
+            line = input("> ").strip()
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            print("\n已退出。")
+            break
+        if not line:
+            continue
+        if line.lower() in ("q", "quit", "exit", "退出"):
+            break
+        try:
+            print(f"\n[开始下载] {line}")
+            rc = _download_link(line, dest_dir, cfg)
+            if rc == 0:
+                print("[完成]")
+            elif rc == 1:
+                print("[部分完成] 重新运行可续传")
+            else:
+                print("[失败] 请检查链接或重试")
+        except Exception as e:
+            print(f"[下载出错] {e}")
+    print("\n已退出，下次见！")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        # 无参数直接运行 → 进入交互模式
+        return _interactive(load_config())
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)

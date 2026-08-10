@@ -16,6 +16,7 @@ class Config:
     servers: list[tuple[str, int]] = field(default_factory=list)
     threads: int = 16
     max_sources: int = 6
+    download_dir: str = ""                    # 交互模式的默认下载目录（记住上次用的）
 
     @property
     def userhash_hex(self) -> str:
@@ -34,6 +35,7 @@ def load_config(path: str | None = None) -> Config:
         cfg.threads = int(data.get("threads", 16))
         cfg.max_sources = int(data.get("max_sources", 6))
         cfg.servers = [tuple(s) for s in data.get("servers", [])]
+        cfg.download_dir = str(data.get("download_dir", ""))
     except (OSError, ValueError, json.JSONDecodeError):
         pass
     if not cfg.userhash:
@@ -51,6 +53,7 @@ def save_config(cfg: Config, path: str | None = None) -> None:
         "threads": cfg.threads,
         "max_sources": cfg.max_sources,
         "servers": [list(s) for s in cfg.servers],
+        "download_dir": cfg.download_dir,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)

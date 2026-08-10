@@ -12,3 +12,7 @@ dist/
 tests/out/
 tests/ed2k_test.bin
 tests/big100.bin
+tests/enhance_src.bin
+
+# 发布辅助临时文件
+release_notes_*.md

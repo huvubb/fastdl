@@ -83,6 +83,13 @@ def parse_size(s: str) -> int:
     return int(float(s) * mult)
 
 
+def parse_limit(s: str | None) -> float:
+    """限速字符串 → 字节/秒；'5M'=5MiB/s，'512K'=512KiB/s。None/空 → 0（不限速）。"""
+    if not s:
+        return 0.0
+    return float(parse_size(s))
+
+
 def retry(fn, attempts: int = 3, base_delay: float = 1.0, backoff: float = 2.0,
           exceptions=(Exception,), on_retry=None):
     """指数退避重试；最后一次异常原样抛出。"""

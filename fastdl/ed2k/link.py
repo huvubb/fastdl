@@ -54,8 +54,9 @@ def _parse_part_hashes(s: str) -> list[bytes]:
 
 
 def parse_ed2k_link(uri: str) -> Ed2kLink:
-    """解析 ed2k://|file|name|size|hash|/（可带 |s=/|h=/|p=/|）。校验失败抛 ValueError。"""
-    m = re.fullmatch(r"ed2k://\|file\|(.*?)\|(\d+)\|([0-9a-fA-F]{32})\|(?:s=([^|]*)\|)?(?:h=([^|]*)\|)?(?:p=([^|]*)\|)?/", uri, re.S)
+    """解析 ed2k://|file|name|size|hash|/（可带 |s=/|h=/|p=/|；结尾斜杠可省略）。校验失败抛 ValueError。"""
+    uri = uri.strip()
+    m = re.fullmatch(r"ed2k://\|file\|(.*?)\|(\d+)\|([0-9a-fA-F]{32})(?:\|(?:s=([^|]*)\|)?(?:h=([^|]*)\|)?(?:p=([^|]*)\|)?/?)?$", uri, re.S)
     if not m:
         raise ValueError(f"不是合法的 ed2k://|file| 链接: {uri[:80]!r}")
     name, size_s, hash_s, s_s, h_s, p_s = m.groups()

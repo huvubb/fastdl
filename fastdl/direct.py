@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -29,6 +30,34 @@ DEFAULT_TIMEOUT = 30
 
 class DownloadError(Exception):
     pass
+
+
+class RateLimiter:
+    """跨线程共享的下载限速器（令牌桶）。limit<=0 表示不限速。
+
+    所有分片线程共用一个实例，保证全局总速率 ≤ limit（而非每线程各限速）。
+    """
+
+    def __init__(self, limit_bps: float = 0.0):
+        self.limit = limit_bps
+        self._tokens = 0.0
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def wait(self, n: int) -> None:
+        """消耗 n 字节配额；不足则休眠补齐，使整体速率不超过 limit。"""
+        if self.limit <= 0 or n <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            self._tokens += (now - self._last) * self.limit
+            self._last = now
+            if self._tokens > self.limit:  # 最多攒 1 秒的配额
+                self._tokens = self.limit
+            self._tokens -= n
+            if self._tokens < 0:
+                time.sleep(-self._tokens / self.limit)
+                self._last = time.monotonic()
 
 
 @dataclass
@@ -59,10 +88,15 @@ def _filename_from_headers(headers: dict, url: str) -> str:
     return unquote(urlsplit(url).path.rstrip("/").split("/")[-1] or "download")
 
 
-def probe(url: str, threads: int = 16, timeout: int = DEFAULT_TIMEOUT) -> ProbeResult:
+def probe(url: str, threads: int = 16, timeout: int = DEFAULT_TIMEOUT,
+          headers: dict | None = None, proxy: str | None = None) -> ProbeResult:
     """权威探针：GET Range bytes=0-0。返回总长 + 是否支持分片 + 元数据。"""
     s = _make_session(threads)
+    if proxy:
+        s.proxies.update({"http": proxy, "https": proxy})
     h = {"Accept-Encoding": "identity"}
+    if headers:
+        h.update(headers)
     try:
         r = s.get(url, headers={**h, "Range": "bytes=0-0"}, timeout=timeout, stream=True)
     except requests.RequestException as e:
@@ -105,7 +139,8 @@ def _part_path(workdir: str, index: int) -> str:
 
 def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requests.Session,
                  resume: bool, timeout: int, progress, stop: dict,
-                 workdir: str, dlmeta_path: str) -> None:
+                 workdir: str, dlmeta_path: str, headers: dict | None = None,
+                 limiter: RateLimiter | None = None) -> None:
     """下载一个 chunk 到 .part.<index>；支持从已有大小续传。失败抛 DownloadError。"""
     start, end = _chunk_range(index, chunk_size, size)
     expect = end - start
@@ -120,7 +155,10 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
 
     range_from = start + existing
     range_to = end - 1
-    h = {"Accept-Encoding": "identity", "Range": f"bytes={range_from}-{range_to}"}
+    h = {"Accept-Encoding": "identity"}
+    if headers:
+        h.update(headers)
+    h["Range"] = f"bytes={range_from}-{range_to}"
     r = session.get(url, headers=h, timeout=timeout, stream=True)
     try:
         if r.status_code == 416:
@@ -144,6 +182,8 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
                     break
                 f.write(b)
                 got += len(b)
+                if limiter:
+                    limiter.wait(len(b))
                 progress.add(len(b), rate_key=f"t{index % 8}")
         if got < (expect - existing):
             raise DownloadError(f"chunk {index} 数据不足: {got} < {expect-existing}")
@@ -179,9 +219,13 @@ def _merge(dest: str, workdir: str, n_chunks: int, size: int, progress=None) -> 
 
 
 def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
-                     resume: bool, timeout: int, stop: dict) -> int:
+                     resume: bool, timeout: int, stop: dict, headers: dict | None = None,
+                     proxy: str | None = None, limit_bps: float = 0.0) -> int:
     session = _make_session(threads)
-    pr = probe(url, threads, timeout)
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
+    limiter = RateLimiter(limit_bps) if limit_bps > 0 else None
+    pr = probe(url, threads, timeout, headers=headers, proxy=proxy)
 
     fn = sanitize_filename(pr.filename or "download")
     final = os.path.join(dest_dir, fn)
@@ -217,6 +261,8 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         # 单线程流式回退（仍支持按已有大小续传）
         have = os.path.getsize(final) if (resume and os.path.exists(final)) else 0
         h = {"Accept-Encoding": "identity"}
+        if headers:
+            h.update(headers)
         if have > 0:
             h["Range"] = f"bytes={have}-"
         r = session.get(url, headers=h, timeout=timeout, stream=True)
@@ -231,6 +277,8 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                     if not b:
                         break
                     f.write(b)
+                    if limiter:
+                        limiter.wait(len(b))
         finally:
             r.close()
         return 0 if os.path.getsize(final) == pr.size else 1
@@ -255,7 +303,8 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                 return
             try:
                 _fetch_chunk(url, i, pr.size, chunk_size, session, resume, timeout,
-                             progress, stop, workdir, dlmeta_path)
+                             progress, stop, workdir, dlmeta_path,
+                             headers=headers, limiter=limiter)
                 return
             except DownloadError as e:
                 last = e
@@ -299,14 +348,22 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
 
 
 def _download_aria2(url: str, dest_dir: str, threads: int, resume: bool,
-                    timeout: int, stop: dict) -> int:
+                    timeout: int, stop: dict, proxy: str | None = None,
+                    limit_bps: float = 0.0, headers: dict | None = None) -> int:
     import subprocess
     fn = sanitize_filename(unquote(urlsplit(url).path.rstrip("/").split("/")[-1]) or "download")
     cmd = ["aria2c", "-x", str(threads), "-s", str(threads), "-k", "8M",
            "--max-tries=3", "--retry-wait=1", "--timeout", str(timeout),
-           "--auto-file-renaming=false", "-o", fn, url]
+           "--auto-file-renaming=false"]
+    for k, v in (headers or {}).items():
+        cmd += ["--header", f"{k}: {v}"]
+    if proxy:
+        cmd += ["--all-proxy", proxy]
+    if limit_bps > 0:
+        cmd += ["--max-download-limit", str(int(limit_bps))]
     if resume:
         cmd.append("--continue=true")
+    cmd += ["-o", fn, url]
     print("调用 aria2c:", " ".join(cmd))
     try:
         r = subprocess.run(cmd, cwd=dest_dir, check=False)
@@ -317,15 +374,18 @@ def _download_aria2(url: str, dest_dir: str, threads: int, resume: bool,
 
 def download(url: str, dest_dir: str = ".", threads: int = 16, chunk_size: int = CHUNK_SIZE,
              resume: bool = True, engine: str = "native", timeout: int = DEFAULT_TIMEOUT,
-             stop: dict | None = None) -> int:
+             stop: dict | None = None, headers: dict | None = None,
+             proxy: str | None = None, limit_bps: float = 0.0) -> int:
     """返回：0 成功，1 部分/可续传，2 失败。"""
     stop = stop or {"flag": False}
     os.makedirs(dest_dir, exist_ok=True)
     if engine == "aria2":
-        return _download_aria2(url, dest_dir, threads, resume, timeout, stop)
+        return _download_aria2(url, dest_dir, threads, resume, timeout, stop,
+                               proxy=proxy, limit_bps=limit_bps, headers=headers)
     if url.lower().startswith("ftp://"):
         from .ftp import ftp_download
         return ftp_download(url, dest_dir, resume, timeout, stop)
     if not url.lower().startswith(("http://", "https://")):
         raise DownloadError(f"不支持的协议: {url.split(':', 1)[0]}")
-    return _download_native(url, dest_dir, threads, chunk_size, resume, timeout, stop)
+    return _download_native(url, dest_dir, threads, chunk_size, resume, timeout, stop,
+                            headers=headers, proxy=proxy, limit_bps=limit_bps)

@@ -2,6 +2,24 @@
 
 对抗迅雷会员也被限速 7KB/s 的正当开源方案：**独立的下载工具**，跟迅雷彻底脱钩。
 
+## 快速开始（交互模式，最常用）
+
+直接运行 `fastdl.exe`（或 `python dl.py`，**不带任何参数**），进入交互界面：
+
+```
+fastdl v1.1 —— 多线程直链 + ed2k 下载器
+不用记参数：粘贴链接即可下载，可一次粘贴多个（每行一个）
+====================================================
+
+下载目录 [默认: D:\fastdl\downloads，直接回车使用]：
+请输入下载链接（http/https/ftp 直链 或 ed2k://；可一次粘贴多个，每行一个；输入 q 退出）
+>
+```
+
+- 粘贴链接 → **自动识别**是直链还是 ed2k → 开始下载 → 显示进度
+- 下完继续粘贴下一个链接；**输入 `q` 退出**
+- 下载目录会记住上次用的，下次默认就是它
+
 ## 安装
 
 ```bash
@@ -23,6 +41,23 @@ python dl.py direct "https://..." --engine aria2 -t 64   # 调用已装 aria2c �
 
 - 固定 8MiB chunk + 多连接并行，断点续传（`.fastdl/` 目录存 `.part` 与 `.dlmeta`，ETag 变了自动重来）。
 - 服务器不支持 Range → 自动单线程流式回退。
+
+### 直链增强（自定义请求头 / 代理 / 限速）
+
+```bash
+# 自定义请求头（--header 可多次；--cookie/--referer/--ua 是常用头的快捷方式）
+python dl.py direct "https://x.com/file" \
+    --header "X-Token: abc123" --cookie "sid=888" \
+    --referer "https://x.com/" --ua "Mozilla/5.0"
+
+# 走 HTTP/HTTPS 代理（所有请求：探针+分片都走代理）
+python dl.py direct "https://x.com/file" --proxy "http://127.0.0.1:7890"
+
+# 全局限速（跨线程令牌桶，总速率不超过指定值），单位如 128K / 5M
+python dl.py direct "https://x.com/file" --limit 5M
+```
+
+- 适合需要登录/带鉴权/防热链的直链下载场景。
 
 ## ed2k 下载
 
