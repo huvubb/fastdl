@@ -1,0 +1,9 @@
+# 候选 eD2k 服务器（ip:port，# 注释）
+# 存活需用 `python dl.py servers --test` 实测；你的网络可能被墙导致 4661 全不通
+46.105.140.242:4661   # emule-security.org No.1
+31.14.40.11:4661      # emule-security.org No.2
+62.109.29.235:4661    # eMule-Masters
+185.65.205.163:7111   # TV-Masters
+46.151.213.18:4661    # First Legion
+5.248.223.55:4661     # Get Smart
+94.250.226.54:4661    # Peerates
