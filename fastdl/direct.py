@@ -26,10 +26,30 @@ from .utils import disk_free, sanitize_filename
 
 CHUNK_SIZE = 8 << 20  # 8 MiB
 DEFAULT_TIMEOUT = 30
+MAX_CHUNK_RETRIES = 8      # 分片级重试（断流后从已写入部分续传）
+MAX_CONNECT_RETRIES = 4    # 单次请求的连接重试（GFW/代理重置时换新连接重试）
 
 
 class DownloadError(Exception):
     pass
+
+
+def _build_retry():
+    """传输层重试策略：连接被重置/丢弃时自动换新连接（对 GFW、代理抖动有效）。
+
+    只重试"连接建立"和 5xx，不重试 read（流中途断开由上层按 Range 续传处理，
+    否则会重复追加数据）。
+    """
+    try:
+        from urllib3.util.retry import Retry
+    except ImportError:
+        return None
+    kw = dict(total=4, connect=4, read=0, status=4, backoff_factor=0.5,
+              status_forcelist=(429, 500, 502, 503, 504), raise_on_status=False)
+    try:
+        return Retry(allowed_methods=frozenset(["GET", "HEAD"]), **kw)
+    except TypeError:  # urllib3 < 1.26
+        return Retry(method_whitelist=frozenset(["GET", "HEAD"]), **kw)
 
 
 class RateLimiter:
@@ -76,10 +96,29 @@ class ProbeResult:
 
 def _make_session(threads: int) -> requests.Session:
     s = requests.Session()
-    adapter = HTTPAdapter(pool_maxsize=threads + 8, pool_connections=threads + 8)
+    retry = _build_retry()
+    adapter = HTTPAdapter(pool_maxsize=threads + 8, pool_connections=threads + 8,
+                          max_retries=retry if retry is not None else 0)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
+
+
+def _get_with_retry(session: requests.Session, url: str, headers: dict, timeout: int,
+                    attempts: int = MAX_CONNECT_RETRIES, stream: bool = True):
+    """带重试的 GET：连接被重置/超时（GFW、代理不稳）时退避后换新连接重试。
+
+    最终仍失败则抛 DownloadError，交由上层（分片级续传）处理。
+    """
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return session.get(url, headers=headers, timeout=(timeout, timeout), stream=stream)
+        except requests.RequestException as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(min(0.8 * (2 ** i), 8))
+    raise DownloadError(f"连接失败（已重试 {attempts} 次）: {last}")
 
 
 def _filename_from_headers(headers: dict, url: str) -> str:
@@ -101,8 +140,8 @@ def probe(url: str, threads: int = 16, timeout: int = DEFAULT_TIMEOUT,
     if headers:
         h.update(headers)
     try:
-        r = s.get(url, headers={**h, "Range": "bytes=0-0"}, timeout=timeout, stream=True)
-    except requests.RequestException as e:
+        r = _get_with_retry(s, url, {**h, "Range": "bytes=0-0"}, timeout, attempts=6)
+    except DownloadError as e:
         raise DownloadError(f"探针失败: {e}") from e
     try:
         if r.status_code == 206 and r.headers.get("Content-Range"):
@@ -163,8 +202,8 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
         h.update(headers)
     h["Range"] = f"bytes={range_from}-{range_to}"
     try:
-        r = session.get(url, headers=h, timeout=(timeout, timeout), stream=True)
-    except requests.RequestException as e:
+        r = _get_with_retry(session, url, h, timeout)
+    except DownloadError as e:
         raise DownloadError(f"chunk {index} 连接失败: {e}") from e
     try:
         if r.status_code == 416:
@@ -268,35 +307,47 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         return 0
 
     if not pr.ranges:
-        # 单线程流式回退（仍支持按已有大小续传）
+        # 单线程流式回退（仍支持按已有大小续传）：断流后自动重连续传
         have = os.path.getsize(final) if (resume and os.path.exists(final)) else 0
-        h = {"Accept-Encoding": "identity"}
-        if headers:
-            h.update(headers)
-        if have > 0:
-            h["Range"] = f"bytes={have}-"
-        try:
-            r = session.get(url, headers=h, timeout=(timeout, timeout), stream=True)
-        except requests.RequestException as e:
-            print(f"\n连接中断，保留进度后重试: {e}")
-            return 1
-        try:
-            mode = "ab" if (resume and have > 0 and r.status_code == 206) else "wb"
-            with open(final, mode) as f:
-                for b in r.iter_content(chunk_size=1 << 20):
-                    if stop.get("flag"):
-                        print("\n已停止，进度保留。")
-                        return 1
-                    if not b:
-                        continue
-                    f.write(b)
-                    if limiter:
-                        limiter.wait(len(b))
-        except (requests.RequestException, OSError) as e:
-            print(f"\n连接中断，保留进度后重试: {e}")
-            return 1
-        finally:
-            r.close()
+        for attempt in range(MAX_CHUNK_RETRIES):
+            if stop.get("flag"):
+                return 1
+            h = {"Accept-Encoding": "identity"}
+            if headers:
+                h.update(headers)
+            if have > 0:
+                h["Range"] = f"bytes={have}-"
+            try:
+                r = _get_with_retry(session, url, h, timeout)
+            except DownloadError as e:
+                if attempt == MAX_CHUNK_RETRIES - 1:
+                    print(f"\n连接中断，进度已保留（重新运行可续传）: {e}")
+                    return 1
+                time.sleep(min(1 * (2 ** attempt), 15))
+                continue
+            try:
+                mode = "ab" if (resume and have > 0 and r.status_code == 206) else "wb"
+                with open(final, mode) as f:
+                    for b in r.iter_content(chunk_size=1 << 20):
+                        if stop.get("flag"):
+                            print("\n已停止，进度保留。")
+                            return 1
+                        if not b:
+                            continue
+                        f.write(b)
+                        have += len(b)
+                        if limiter:
+                            limiter.wait(len(b))
+            except (requests.RequestException, OSError) as e:
+                if attempt == MAX_CHUNK_RETRIES - 1:
+                    print(f"\n连接中断，进度已保留（重新运行可续传）: {e}")
+                    return 1
+                time.sleep(min(1 * (2 ** attempt), 15))
+                continue
+            finally:
+                r.close()
+            if os.path.getsize(final) == pr.size:
+                return 0
         return 0 if os.path.getsize(final) == pr.size else 1
 
     # 分片模式
@@ -315,7 +366,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             return
         last = None
         # 断流后使用已写入的 part 续传；短暂拥塞不应立即判定失败。
-        for attempt in range(8):
+        for attempt in range(MAX_CHUNK_RETRIES):
             if stop.get("flag"):
                 return
             try:
@@ -328,7 +379,8 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                 time.sleep(min(1 * (2 ** attempt), 15))
         if stop.get("flag"):
             return
-        raise RuntimeError(f"chunk {i} 下载失败: {last}")
+        # 不抛出：保留其它分片进度，整块标记为未完成 → 返回 1 可续传
+        print(f"\n分片 {i} 多次重试仍失败（进度已保留，重新运行可续传）: {last}")
 
     try:
         with ThreadPoolExecutor(max_workers=threads) as ex:
