@@ -274,7 +274,13 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     if proxy:
         session.proxies.update({"http": proxy, "https": proxy})
     limiter = RateLimiter(limit_bps) if limit_bps > 0 else None
-    pr = probe(url, threads, timeout, headers=headers, proxy=proxy)
+    try:
+        pr = probe(url, threads, timeout, headers=headers, proxy=proxy)
+    except DownloadError as e:
+        raise DownloadError(
+            f"{e}\n提示：境外站点（如 github）连接被重置/超时多为网络或代理问题——"
+            f"请确认加速器节点可用，或用 --proxy 指定可用代理；境内站点不受影响。"
+        ) from e
 
     fn = sanitize_filename(pr.filename or "download")
     final = os.path.join(dest_dir, fn)
