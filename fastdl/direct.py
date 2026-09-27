@@ -55,8 +55,11 @@ class RateLimiter:
             if self._tokens > self.limit:  # 最多攒 1 秒的配额
                 self._tokens = self.limit
             self._tokens -= n
-            if self._tokens < 0:
-                time.sleep(-self._tokens / self.limit)
+            delay = -self._tokens / self.limit if self._tokens < 0 else 0
+        # 不能持锁睡眠，否则会把其它下载线程全部堵住，表现为速度归零。
+        if delay > 0:
+            time.sleep(delay)
+            with self._lock:
                 self._last = time.monotonic()
 
 
@@ -145,7 +148,7 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
     start, end = _chunk_range(index, chunk_size, size)
     expect = end - start
     part_path = _part_path(workdir, index)
-    existing = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+    existing = os.path.getsize(part_path) if resume and os.path.exists(part_path) else 0
     if existing >= expect:
         return  # 已完成
 
@@ -159,7 +162,10 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
     if headers:
         h.update(headers)
     h["Range"] = f"bytes={range_from}-{range_to}"
-    r = session.get(url, headers=h, timeout=timeout, stream=True)
+    try:
+        r = session.get(url, headers=h, timeout=(timeout, timeout), stream=True)
+    except requests.RequestException as e:
+        raise DownloadError(f"chunk {index} 连接失败: {e}") from e
     try:
         if r.status_code == 416:
             if os.path.exists(part_path):
@@ -174,12 +180,12 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
         mode = "ab" if (resume and existing > 0) else "wb"
         got = 0
         with open(part_path, mode) as f:
-            while True:
+            # iter_content 会把底层的断流/解码异常抛出；不能把一次短读误判为 EOF。
+            for b in r.iter_content(chunk_size=1 << 20):
                 if stop.get("flag"):
                     raise DownloadError("已停止")
-                b = r.raw.read(1 << 20)
                 if not b:
-                    break
+                    continue
                 f.write(b)
                 got += len(b)
                 if limiter:
@@ -187,6 +193,10 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
                 progress.add(len(b), rate_key=f"t{index % 8}")
         if got < (expect - existing):
             raise DownloadError(f"chunk {index} 数据不足: {got} < {expect-existing}")
+        if got > (expect - existing):
+            raise DownloadError(f"chunk {index} 数据超量: {got} > {expect-existing}")
+    except (requests.RequestException, OSError) as e:
+        raise DownloadError(f"chunk {index} 传输中断: {e}") from e
     finally:
         r.close()
 
@@ -265,20 +275,26 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             h.update(headers)
         if have > 0:
             h["Range"] = f"bytes={have}-"
-        r = session.get(url, headers=h, timeout=timeout, stream=True)
+        try:
+            r = session.get(url, headers=h, timeout=(timeout, timeout), stream=True)
+        except requests.RequestException as e:
+            print(f"\n连接中断，保留进度后重试: {e}")
+            return 1
         try:
             mode = "ab" if (resume and have > 0 and r.status_code == 206) else "wb"
             with open(final, mode) as f:
-                while True:
+                for b in r.iter_content(chunk_size=1 << 20):
                     if stop.get("flag"):
                         print("\n已停止，进度保留。")
                         return 1
-                    b = r.raw.read(1 << 20)
                     if not b:
-                        break
+                        continue
                     f.write(b)
                     if limiter:
                         limiter.wait(len(b))
+        except (requests.RequestException, OSError) as e:
+            print(f"\n连接中断，保留进度后重试: {e}")
+            return 1
         finally:
             r.close()
         return 0 if os.path.getsize(final) == pr.size else 1
@@ -298,7 +314,8 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         if stop.get("flag"):
             return
         last = None
-        for attempt in range(3):
+        # 断流后使用已写入的 part 续传；短暂拥塞不应立即判定失败。
+        for attempt in range(8):
             if stop.get("flag"):
                 return
             try:
@@ -308,7 +325,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                 return
             except DownloadError as e:
                 last = e
-                time.sleep(1 * (2 ** attempt))
+                time.sleep(min(1 * (2 ** attempt), 15))
         if stop.get("flag"):
             return
         raise RuntimeError(f"chunk {i} 下载失败: {last}")
