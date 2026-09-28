@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket as _socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -24,10 +25,27 @@ from requests.adapters import HTTPAdapter
 from .progress import SingleLineProgress
 from .utils import disk_free, sanitize_filename
 
-CHUNK_SIZE = 8 << 20  # 8 MiB
+CHUNK_SIZE = 8 << 20  # 8 MiB（上限；实际会按文件大小/线程数自适应）
+MIN_CHUNK = 1 << 20   # 1 MiB（下限）
 DEFAULT_TIMEOUT = 30
 MAX_CHUNK_RETRIES = 8      # 分片级重试（断流后从已写入部分续传）
 MAX_CONNECT_RETRIES = 4    # 单次请求的连接重试（GFW/代理重置时换新连接重试）
+
+# socket 调优：小分片请求对延迟敏感 → Nagle 必须关；接收缓冲加大提升大带宽吞吐
+_SOCKET_OPTIONS = [
+    (_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1),
+    (_socket.SOL_SOCKET, _socket.SO_RCVBUF, 2 << 20),
+]
+
+
+def _auto_chunk_size(size: int, threads: int) -> int:
+    """按文件大小/线程数自适应分片：块太多太小→开销大，太少→并行度不足。"""
+    if size <= 0:
+        return CHUNK_SIZE
+    want = max(1, threads * 4)          # 每线程约 4 块，兼顾并行与负载均衡
+    cs = size // want
+    cs = max(MIN_CHUNK, min(CHUNK_SIZE, cs))
+    return max(MIN_CHUNK, (cs // MIN_CHUNK) << 20)
 
 
 class DownloadError(Exception):
@@ -92,16 +110,61 @@ class ProbeResult:
     last_modified: str | None = None
     filename: str | None = None
     method: str = "range-probe"
+    final_url: str | None = None   # 跟随重定向后的真实地址（如 GitHub release → 签名直链）
 
 
-def _make_session(threads: int) -> requests.Session:
+def _is_loopback(proxy: str) -> bool:
+    try:
+        host = urlsplit(proxy).hostname or proxy
+    except Exception:  # noqa: BLE001
+        host = proxy
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _make_session(threads: int, source_ip: str | None = None,
+                  proxy: str | None = None) -> requests.Session:
     s = requests.Session()
+    # 行为完全由参数决定，不偷偷使用环境变量里的代理（HTTPS_PROXY 等）
+    s.trust_env = False
+    bind_ip = source_ip
+    if bind_ip and proxy and _is_loopback(proxy):
+        # 本地代理必须走回环：源地址绑到物理网卡会连不上（WinError 10049）
+        bind_ip = None
     retry = _build_retry()
-    adapter = HTTPAdapter(pool_maxsize=threads + 8, pool_connections=threads + 8,
-                          max_retries=retry if retry is not None else 0)
+    adapter = _FastAdapter(bind_ip, pool_maxsize=threads + 8, pool_connections=threads + 8,
+                           max_retries=retry if retry is not None else 0)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
+    if proxy:
+        s.proxies.update({"http": proxy, "https": proxy})
     return s
+
+
+class _FastAdapter(HTTPAdapter):
+    """给连接池注入 socket 调优；可选把源地址绑定到指定网卡。
+
+    - TCP_NODELAY：Range 小请求对延迟敏感，关 Nagle
+    - SO_RCVBUF：加大接收缓冲提升大带宽吞吐
+    - source_address：只有用它的流量走那张网卡
+    """
+
+    def __init__(self, source_ip: str | None = None, **kw):
+        self._source_ip = source_ip
+        super().__init__(**kw)
+
+    def _extra(self) -> dict:
+        d = {"socket_options": _SOCKET_OPTIONS}
+        if self._source_ip:
+            d["source_address"] = (self._source_ip, 0)
+        return d
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs.update(self._extra())
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args, **kwargs):
+        kwargs.update(self._extra())
+        return super().proxy_manager_for(*args, **kwargs)
 
 
 def _get_with_retry(session: requests.Session, url: str, headers: dict, timeout: int,
@@ -131,9 +194,10 @@ def _filename_from_headers(headers: dict, url: str) -> str:
 
 
 def probe(url: str, threads: int = 16, timeout: int = DEFAULT_TIMEOUT,
-          headers: dict | None = None, proxy: str | None = None) -> ProbeResult:
+          headers: dict | None = None, proxy: str | None = None,
+          source_ip: str | None = None) -> ProbeResult:
     """权威探针：GET Range bytes=0-0。返回总长 + 是否支持分片 + 元数据。"""
-    s = _make_session(threads)
+    s = _make_session(threads, source_ip=source_ip, proxy=proxy)
     if proxy:
         s.proxies.update({"http": proxy, "https": proxy})
     h = {"Accept-Encoding": "identity"}
@@ -164,6 +228,7 @@ def probe(url: str, threads: int = 16, timeout: int = DEFAULT_TIMEOUT,
             etag=r.headers.get("ETag"),
             last_modified=r.headers.get("Last-Modified"),
             filename=_filename_from_headers(r.headers, url),
+            final_url=r.url if r.url and r.url != url else None,
         )
     finally:
         r.close()
@@ -245,6 +310,16 @@ def _write_meta(path: str, data: dict) -> None:
         json.dump(data, f)
 
 
+def _cleanup_workdir(workdir: str) -> None:
+    """下载完成后移除 <name>.fastdl 目录（.fastdl 只在"未完成"时存在）。"""
+    try:
+        for f in os.listdir(workdir):
+            os.remove(os.path.join(workdir, f))
+        os.rmdir(workdir)
+    except OSError:
+        pass
+
+
 def _merge(dest: str, workdir: str, n_chunks: int, size: int, progress=None) -> None:
     """按索引顺序把 .part.<i> 流式合并进最终文件，拷完即删。"""
     with open(dest, "wb") as out:
@@ -269,24 +344,28 @@ def _merge(dest: str, workdir: str, n_chunks: int, size: int, progress=None) -> 
 
 def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                      resume: bool, timeout: int, stop: dict, headers: dict | None = None,
-                     proxy: str | None = None, limit_bps: float = 0.0) -> int:
-    session = _make_session(threads)
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
+                     proxy: str | None = None, limit_bps: float = 0.0,
+                     source_ip: str | None = None) -> int:
+    session = _make_session(threads, source_ip=source_ip, proxy=proxy)
     limiter = RateLimiter(limit_bps) if limit_bps > 0 else None
     try:
-        pr = probe(url, threads, timeout, headers=headers, proxy=proxy)
+        pr = probe(url, threads, timeout, headers=headers, proxy=proxy, source_ip=source_ip)
     except DownloadError as e:
         raise DownloadError(
             f"{e}\n提示：境外站点（如 github）连接被重置/超时多为网络或代理问题——"
             f"请确认加速器节点可用，或用 --proxy 指定可用代理；境内站点不受影响。"
         ) from e
 
+    fetch_url = pr.final_url or url          # 直接打重定向后的真实地址，省一次 302 往返
+    if chunk_size <= 0:
+        chunk_size = _auto_chunk_size(pr.size, threads)
+
     fn = sanitize_filename(pr.filename or "download")
     final = os.path.join(dest_dir, fn)
     workdir = os.path.join(dest_dir, f"{fn}.fastdl")
-    os.makedirs(workdir, exist_ok=True)
     dlmeta_path = os.path.join(workdir, ".dlmeta")
+    # 注意：workdir 只在「分片模式」下创建（目录）；「单流模式」用的是同名
+    # <name>.fastdl 文件，二者不能同时存在，所以此处不能预先建目录。
 
     meta = None
     if resume and os.path.exists(dlmeta_path):
@@ -296,7 +375,9 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         except (OSError, json.JSONDecodeError):
             meta = None
     if meta:
-        if meta.get("url") != url or meta.get("size") != pr.size or meta.get("etag") != pr.etag:
+        # chunk_size 必须一致，否则 .part.<i> 与字节区间的映射会错位
+        if (meta.get("url") != url or meta.get("size") != pr.size
+                or meta.get("etag") != pr.etag or meta.get("chunk_size") != chunk_size):
             for f in os.listdir(workdir):
                 if f.startswith(".part."):
                     os.remove(os.path.join(workdir, f))
@@ -306,6 +387,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     if (resume and meta is not None and pr.size > 0
             and os.path.exists(final) and os.path.getsize(final) == pr.size):
         print(f"已存在完整文件，跳过: {final}")
+        _cleanup_workdir(workdir)
         return 0
 
     if pr.size == 0:
@@ -313,8 +395,15 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         return 0
 
     if not pr.ranges:
-        # 单线程流式回退（仍支持按已有大小续传）：断流后自动重连续传
-        have = os.path.getsize(final) if (resume and os.path.exists(final)) else 0
+        # 单线程流式回退：写 <文件名>.fastdl，下完才改回正式名（半成品一眼可辨）
+        part_file = final + ".fastdl"
+        if os.path.isdir(part_file):
+            # 极少见：同一 URL 之前走过分片模式留下了同名目录，避开冲突
+            part_file = final + ".fastdl.part"
+        # 兼容旧行为：若正式名已是完整文件，直接用
+        if (resume and os.path.exists(final) and os.path.getsize(final) == pr.size):
+            return 0
+        have = os.path.getsize(part_file) if (resume and os.path.exists(part_file)) else 0
         for attempt in range(MAX_CHUNK_RETRIES):
             if stop.get("flag"):
                 return 1
@@ -324,16 +413,16 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             if have > 0:
                 h["Range"] = f"bytes={have}-"
             try:
-                r = _get_with_retry(session, url, h, timeout)
+                r = _get_with_retry(session, fetch_url, h, timeout)
             except DownloadError as e:
                 if attempt == MAX_CHUNK_RETRIES - 1:
-                    print(f"\n连接中断，进度已保留（重新运行可续传）: {e}")
+                    print(f"\n连接中断，进度已保留（.fastdl 文件续传）: {e}")
                     return 1
                 time.sleep(min(1 * (2 ** attempt), 15))
                 continue
             try:
                 mode = "ab" if (resume and have > 0 and r.status_code == 206) else "wb"
-                with open(final, mode) as f:
+                with open(part_file, mode) as f:
                     for b in r.iter_content(chunk_size=1 << 20):
                         if stop.get("flag"):
                             print("\n已停止，进度保留。")
@@ -346,23 +435,27 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                             limiter.wait(len(b))
             except (requests.RequestException, OSError) as e:
                 if attempt == MAX_CHUNK_RETRIES - 1:
-                    print(f"\n连接中断，进度已保留（重新运行可续传）: {e}")
+                    print(f"\n连接中断，进度已保留（.fastdl 文件续传）: {e}")
                     return 1
                 time.sleep(min(1 * (2 ** attempt), 15))
                 continue
             finally:
                 r.close()
-            if os.path.getsize(final) == pr.size:
+            if os.path.getsize(part_file) == pr.size:
+                os.replace(part_file, final)      # 下完才改回正式名
                 return 0
         return 0 if os.path.getsize(final) == pr.size else 1
 
     # 分片模式
     n_chunks = (pr.size + chunk_size - 1) // chunk_size
+    os.makedirs(workdir, exist_ok=True)
     if meta is None:
         _write_meta(dlmeta_path, {
             "url": url, "size": pr.size, "etag": pr.etag,
             "last_modified": pr.last_modified, "chunk_size": chunk_size, "n_chunks": n_chunks,
         })
+    print(f"分片：{n_chunks} 块 × {chunk_size >> 20}MiB，{threads} 线程并行"
+          + ("（已启用重定向直链）" if pr.final_url else ""))
 
     progress = SingleLineProgress(pr.size, label=f"{fn} ")
     # 各线程速率暂不显示（聚合速率已覆盖），避免显示 0B/s
@@ -370,13 +463,16 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     def worker(i):
         if stop.get("flag"):
             return
+        # 优先用重定向后的直链（省 302）；若连续失败则回退到原始 URL
+        # （签名直链可能有时效或 CDN 限流，回退可保证长下载不中断）
+        urls = [fetch_url] if fetch_url == url else [fetch_url, url]
         last = None
-        # 断流后使用已写入的 part 续传；短暂拥塞不应立即判定失败。
         for attempt in range(MAX_CHUNK_RETRIES):
             if stop.get("flag"):
                 return
+            use = urls[min(attempt // 2, len(urls) - 1)]
             try:
-                _fetch_chunk(url, i, pr.size, chunk_size, session, resume, timeout,
+                _fetch_chunk(use, i, pr.size, chunk_size, session, resume, timeout,
                              progress, stop, workdir, dlmeta_path,
                              headers=headers, limiter=limiter)
                 return
@@ -419,6 +515,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     if os.path.exists(final):
         os.remove(final)
     _merge(final, workdir, n_chunks, pr.size)
+    _cleanup_workdir(workdir)
     return 0
 
 
@@ -447,10 +544,11 @@ def _download_aria2(url: str, dest_dir: str, threads: int, resume: bool,
         raise DownloadError("aria2c 未安装")
 
 
-def download(url: str, dest_dir: str = ".", threads: int = 16, chunk_size: int = CHUNK_SIZE,
+def download(url: str, dest_dir: str = ".", threads: int = 16, chunk_size: int = 0,
              resume: bool = True, engine: str = "native", timeout: int = DEFAULT_TIMEOUT,
              stop: dict | None = None, headers: dict | None = None,
-             proxy: str | None = None, limit_bps: float = 0.0) -> int:
+             proxy: str | None = None, limit_bps: float = 0.0,
+             source_ip: str | None = None) -> int:
     """返回：0 成功，1 部分/可续传，2 失败。"""
     stop = stop or {"flag": False}
     os.makedirs(dest_dir, exist_ok=True)
@@ -463,4 +561,5 @@ def download(url: str, dest_dir: str = ".", threads: int = 16, chunk_size: int =
     if not url.lower().startswith(("http://", "https://")):
         raise DownloadError(f"不支持的协议: {url.split(':', 1)[0]}")
     return _download_native(url, dest_dir, threads, chunk_size, resume, timeout, stop,
-                            headers=headers, proxy=proxy, limit_bps=limit_bps)
+                            headers=headers, proxy=proxy, limit_bps=limit_bps,
+                            source_ip=source_ip)

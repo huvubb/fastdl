@@ -14,9 +14,11 @@ class Config:
     userhash: bytes = b""                     # 身份标识，urandom(16) 生成一次并持久化
     tcp_port: int = 4662                      # 广告端口（不监听也能查源）
     servers: list[tuple[str, int]] = field(default_factory=list)
-    threads: int = 16
+    threads: int = 32
     max_sources: int = 6
     download_dir: str = ""                    # 交互模式的默认下载目录（记住上次用的）
+    iface_ip: str = ""                        # 选中的下载网卡 IP（空=自动/跟随系统）
+    iface_name: str = ""                      # 选中的下载网卡名（仅用于显示）
 
     @property
     def userhash_hex(self) -> str:
@@ -32,10 +34,12 @@ def load_config(path: str | None = None) -> Config:
         if isinstance(data.get("userhash"), str) and len(data["userhash"]) == 32:
             cfg.userhash = bytes.fromhex(data["userhash"])
         cfg.tcp_port = int(data.get("tcp_port", 4662))
-        cfg.threads = int(data.get("threads", 16))
+        cfg.threads = int(data.get("threads", 32))
         cfg.max_sources = int(data.get("max_sources", 6))
         cfg.servers = [tuple(s) for s in data.get("servers", [])]
         cfg.download_dir = str(data.get("download_dir", ""))
+        cfg.iface_ip = str(data.get("iface_ip", ""))
+        cfg.iface_name = str(data.get("iface_name", ""))
     except (OSError, ValueError, json.JSONDecodeError):
         pass
     if not cfg.userhash:
@@ -54,6 +58,8 @@ def save_config(cfg: Config, path: str | None = None) -> None:
         "max_sources": cfg.max_sources,
         "servers": [list(s) for s in cfg.servers],
         "download_dir": cfg.download_dir,
+        "iface_ip": cfg.iface_ip,
+        "iface_name": cfg.iface_name,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)

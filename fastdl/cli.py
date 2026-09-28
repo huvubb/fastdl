@@ -7,7 +7,7 @@ import sys
 
 from . import __version__
 from .config import load_config, save_config
-from .utils import human_bytes
+from .utils import default_download_dir, human_bytes
 
 
 def _cmd_hash(args) -> int:
@@ -219,7 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _download_link(link: str, dest_dir: str, cfg) -> int:
+def _download_link(link: str, dest_dir: str, cfg, source_ip: str | None = None) -> int:
     """按链接类型分发下载。返回：0 完成，1 部分/可续传，2 失败。"""
     low = link.lower()
     if low.startswith("ed2k://"):
@@ -237,53 +237,191 @@ def _download_link(link: str, dest_dir: str, cfg) -> int:
         return dl.run()
     if low.startswith(("http://", "https://", "ftp://")):
         from .direct import download
-        return download(link, dest_dir=dest_dir, threads=cfg.threads)
+        return download(link, dest_dir=dest_dir, threads=cfg.threads, source_ip=source_ip)
     raise ValueError(f"无法识别的链接类型: {link[:60]}")
 
 
-def _interactive(cfg) -> int:
-    """无参数启动：交互模式，粘贴链接即下载，自动识别直链/ed2k。"""
-    print("=" * 52)
-    print(f"  fastdl {__version__} —— 多线程直链 + ed2k 下载器")
-    print("  不用记参数：粘贴链接即可下载，可一次粘贴多个（每行一个）")
-    print("=" * 52)
-
-    default_dir = cfg.download_dir or os.path.join(os.getcwd(), "downloads")
+def _ask(prompt: str) -> str | None:
+    """读一行输入；EOF / Ctrl+C 返回 None（上层据此退出）。"""
     try:
-        ans = input(f"\n下载目录 [默认: {default_dir}，直接回车使用]：").strip()
-    except EOFError:
-        return 0
-    dest_dir = ans or default_dir
-    if dest_dir != cfg.download_dir:
-        cfg.download_dir = dest_dir
-        save_config(cfg)
-    os.makedirs(dest_dir, exist_ok=True)
-    print(f"下载到: {dest_dir}\n")
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return None
 
-    print("请输入下载链接（http/https/ftp 直链 或 ed2k://；可一次粘贴多个，每行一个；输入 q 退出）")
+
+def _pick_iface(cfg) -> None:
+    """选择下载网卡：只有下载器的 TCP 会绑定到这张网卡。"""
+    from .netif import default_interface, list_interfaces
+
+    ifaces = list_interfaces()
+    print("\n本机网卡（选中后，只有下载器的 TCP 会走它）：")
+    print("  [0] 自动（跟随系统默认路由）")
+    for i, it in enumerate(ifaces, 1):
+        tag = {"physical": "物理", "virtual": "虚拟", "loopback": "回环"}.get(it["kind"], "?")
+        cur = "  <-当前" if cfg.iface_ip and it["ip"] == cfg.iface_ip else ""
+        print(f"  [{i}] {it['name']}    {it['ip']}    ({tag}){cur}")
+    d = default_interface()
+    if d:
+        print(f"  提示：系统当前默认出口是 {d['ip']}")
+
+    sel = _ask("请选择编号（直接回车=取消）：")
+    if sel is None:
+        return
+    sel = sel.strip()
+    if not sel:
+        print("  已取消。")
+        return
+    if not sel.isdigit():
+        print("  输入无效。")
+        return
+    n = int(sel)
+    if n == 0:
+        cfg.iface_ip, cfg.iface_name = "", ""
+        save_config(cfg)
+        print("  已设为：自动（跟随系统）")
+    elif 1 <= n <= len(ifaces):
+        it = ifaces[n - 1]
+        cfg.iface_ip, cfg.iface_name = it["ip"], it["name"]
+        save_config(cfg)
+        print(f"  已选定：{it['name']} ({it['ip']})")
+        print("  之后下载的 TCP 会绑定这张网卡，其它软件不受影响。")
+    else:
+        print("  编号超出范围。")
+
+
+def _clear_conns() -> None:
+    """清理半死/僵尸 TCP 连接。"""
+    from .conns import clear_invalid, scan
+
+    items = scan(only_invalid=True)
+    if not items:
+        print("\n没有发现无效连接（半死/僵尸状态）。")
+        return
+    print(f"\n发现 {len(items)} 条无效连接：")
+    for c in items[:20]:
+        print(f"  {c['status']:<10} {c['laddr_s']} -> {c['raddr_s']}   pid={c['pid']}")
+    if len(items) > 20:
+        print(f"  ... 还有 {len(items) - 20} 条")
+    ans = _ask("确认全部清理？[y/N]：")
+    if ans is None or ans.strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+    tried, ok, errs = clear_invalid()
+    print(f"  已清理 {ok}/{tried} 条。")
+    for e in errs:
+        print(f"  提示：{e}")
+
+
+def _show_conns() -> None:
+    from collections import Counter
+
+    from .conns import scan
+
+    items = scan()
+    if not items:
+        print("\n（读不到连接：可能需要权限，或系统不支持）")
+        return
+    cnt = Counter(c["status"] for c in items)
+    print(f"\n本机 TCP 连接共 {len(items)} 条：")
+    for st, n in cnt.most_common():
+        print(f"  {st:<12} {n}")
+
+
+def _set_dir(cfg) -> None:
+    ans = _ask(f"新的下载目录 [当前: {cfg.download_dir}]：")
+    if ans is None or not ans.strip():
+        print("  已取消。")
+        return
+    cfg.download_dir = ans.strip()
+    save_config(cfg)
+    os.makedirs(cfg.download_dir, exist_ok=True)
+    print(f"  已设为：{cfg.download_dir}")
+
+
+def _set_threads(cfg) -> None:
+    ans = _ask(f"并行线程数 [当前: {cfg.threads}，建议 32~64，越大越快但吃带宽]：")
+    if ans is None or not ans.strip():
+        print("  已取消。")
+        return
+    try:
+        n = int(ans.strip())
+    except ValueError:
+        print("  请输入数字。")
+        return
+    if not (1 <= n <= 256):
+        print("  范围 1~256。")
+        return
+    cfg.threads = n
+    save_config(cfg)
+    print(f"  已设为：{n} 线程")
+
+
+def _menu_download(cfg) -> None:
+    print("\n粘贴下载链接（http/https/ftp 直链 或 ed2k://；可一次粘贴多个，每行一个）")
+    print("输入 q 返回主菜单")
     while True:
-        try:
-            line = input("> ").strip()
-        except EOFError:
-            break
-        except KeyboardInterrupt:
-            print("\n已退出。")
-            break
+        line = _ask("> ")
+        if line is None:
+            return
+        line = line.strip()
         if not line:
             continue
-        if line.lower() in ("q", "quit", "exit", "退出"):
-            break
+        if line.lower() in ("q", "quit", "exit", "退出", "返回"):
+            return
         try:
             print(f"\n[开始下载] {line}")
-            rc = _download_link(line, dest_dir, cfg)
+            rc = _download_link(line, cfg.download_dir, cfg, cfg.iface_ip or None)
             if rc == 0:
                 print("[完成]")
             elif rc == 1:
                 print("[部分完成] 重新运行可续传")
             else:
                 print("[失败] 请检查链接或重试")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[下载出错] {e}")
+
+
+def _interactive(cfg) -> int:
+    """无参数启动：菜单式界面，全程数字选择，不用记任何参数。"""
+    print("=" * 56)
+    print(f"  fastdl {__version__} —— 多线程直链 + ed2k 下载器")
+    print("  菜单操作，不用记参数")
+    print("=" * 56)
+    if not cfg.download_dir:
+        cfg.download_dir = default_download_dir()
+    os.makedirs(cfg.download_dir, exist_ok=True)
+
+    while True:
+        iface = f"{cfg.iface_name} ({cfg.iface_ip})" if cfg.iface_ip else "自动（跟随系统）"
+        print(f"\n下载目录：{cfg.download_dir}")
+        print(f"下载网卡：{iface}")
+        print("  [1] 下载（粘贴链接）")
+        print("  [2] 选择下载网卡")
+        print("  [3] 清理无效连接")
+        print("  [4] 查看网络连接")
+        print("  [5] 修改下载目录")
+        print("  [6] 设置线程数")
+        print("  [0] 退出")
+        sel = _ask("请选择：")
+        if sel is None:
+            break
+        sel = sel.strip()
+        if sel == "1":
+            _menu_download(cfg)
+        elif sel == "2":
+            _pick_iface(cfg)
+        elif sel == "3":
+            _clear_conns()
+        elif sel == "4":
+            _show_conns()
+        elif sel == "5":
+            _set_dir(cfg)
+        elif sel == "6":
+            _set_threads(cfg)
+        elif sel in ("0", "q", "quit", "exit", "退出"):
+            break
+        elif sel:
+            print("  无效选择，请输入数字。")
     print("\n已退出，下次见！")
     return 0
 

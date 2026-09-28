@@ -7,6 +7,16 @@ import shutil
 import time
 
 
+def default_download_dir() -> str:
+    """默认下载目录：用户「下载」文件夹（Windows: C:\\Users\\<你>\\Downloads）。"""
+    home = os.path.expanduser("~")
+    for name in ("Downloads", "下载"):
+        p = os.path.join(home, name)
+        if os.path.isdir(p):
+            return p
+    return home
+
+
 def human_bytes(n: int | float | None) -> str:
     if n is None:
         return "?"
