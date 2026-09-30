@@ -28,6 +28,7 @@ class SingleLineProgress:
         self._samples: deque[tuple[float, int]] = deque()
         self._last_plain_print = 0.0
         self._last_width = 0
+        self.current_rate = 0.0
 
     def add(self, delta: int, rate_key: str | None = None, rate_val: float = 0.0):
         self.done += delta
@@ -54,6 +55,7 @@ class SingleLineProgress:
         else:
             pct = min(100.0, self.done / self.total * 100)
         rate = self._rate()
+        self.current_rate = rate
         eta = (self.total - self.done) / rate if rate > 0 else None
         bar_w = 22
         # 方括号进度条，中间固定显示百分比，兼容 Windows 控制台编码。
