@@ -26,6 +26,8 @@ class SingleLineProgress:
         self._last_done = 0.0
         self._last_t = self._t0
         self._samples: deque[tuple[float, int]] = deque()
+        self._last_plain_print = 0.0
+        self._last_width = 0
 
     def add(self, delta: int, rate_key: str | None = None, rate_val: float = 0.0):
         self.done += delta
@@ -79,11 +81,24 @@ class SingleLineProgress:
     def paint(self):
         line = self._safe(self.render())
         if _ANSI:
+            # 清掉上一行残留字符，避免 ETA 后粘上文件名等旧内容。
             sys.stdout.write("\r\033[K" + line)
+        elif not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+            # 重定向/IDE 控制台通常不处理 \r；限频换行，避免输出被拼成乱码。
+            now = time.time()
+            if now - self._last_plain_print < 1.0 and self.done < self.total:
+                return
+            self._last_plain_print = now
+            sys.stdout.write(line + "\n")
         else:
-            sys.stdout.write("\r" + line)
+            padding = max(0, self._last_width - len(line))
+            sys.stdout.write("\r" + line + (" " * padding))
+            self._last_width = len(line)
         sys.stdout.flush()
 
     def finish(self, msg: str = ""):
-        sys.stdout.write("\r\033[K" + self._safe(msg) + "\n")
+        if _ANSI or (hasattr(sys.stdout, "isatty") and sys.stdout.isatty()):
+            sys.stdout.write("\r\033[K" + self._safe(msg) + "\n")
+        elif msg:
+            sys.stdout.write(self._safe(msg) + "\n")
         sys.stdout.flush()
