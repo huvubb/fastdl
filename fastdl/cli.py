@@ -184,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("direct", help="多线程直链下载")
     d.add_argument("url")
-    d.add_argument("-t", "--threads", type=int, default=0, help="线程数（默认读配置）")
+    d.add_argument("-t", "--threads", type=int, default=0, help="线程数（默认 128，速度优先）")
     d.add_argument("-o", "--output", default=".", help="保存目录")
     d.add_argument("--no-resume", action="store_true", help="禁用断点续传")
     d.add_argument("--engine", choices=["native", "aria2"], default="native",
@@ -339,7 +339,7 @@ def _set_dir(cfg) -> None:
 
 
 def _set_threads(cfg) -> None:
-    ans = _ask(f"并行线程数 [当前: {cfg.threads}，建议 32~64，越大越快但吃带宽]：")
+    ans = _ask(f"并行线程数 [当前: {cfg.threads}，建议 64~256，速度优先但吃连接/带宽]：")
     if ans is None or not ans.strip():
         print("  已取消。")
         return
@@ -348,8 +348,8 @@ def _set_threads(cfg) -> None:
     except ValueError:
         print("  请输入数字。")
         return
-    if not (1 <= n <= 256):
-        print("  范围 1~256。")
+    if not (1 <= n <= 512):
+        print("  范围 1~512。")
         return
     cfg.threads = n
     save_config(cfg)

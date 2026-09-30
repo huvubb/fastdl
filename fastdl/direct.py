@@ -25,8 +25,8 @@ from requests.adapters import HTTPAdapter
 from .progress import SingleLineProgress
 from .utils import disk_free, sanitize_filename
 
-CHUNK_SIZE = 8 << 20  # 8 MiB（上限；实际会按文件大小/线程数自适应）
-MIN_CHUNK = 1 << 20   # 1 MiB（下限）
+CHUNK_SIZE = 16 << 20  # 16 MiB（高吞吐上限；按文件大小/线程数自适应）
+MIN_CHUNK = 4 << 20    # 4 MiB（减少小分片请求开销）
 DEFAULT_TIMEOUT = 30
 MAX_CHUNK_RETRIES = 8      # 分片级重试（断流后从已写入部分续传）
 MAX_CONNECT_RETRIES = 4    # 单次请求的连接重试（GFW/代理重置时换新连接重试）
@@ -43,7 +43,7 @@ def _auto_chunk_size(size: int, threads: int) -> int:
     """按文件大小/线程数自适应分片：块太多太小→开销大，太少→并行度不足。"""
     if size <= 0:
         return CHUNK_SIZE
-    want = max(1, threads * 4)          # 每线程约 4 块，兼顾并行与负载均衡
+    want = max(1, threads * 2)          # 每线程约 2 块，优先吞吐，减少请求开销
     cs = size // want
     cs = max(MIN_CHUNK, min(CHUNK_SIZE, cs))
     return max(MIN_CHUNK, (cs // MIN_CHUNK) << 20)
@@ -547,7 +547,7 @@ def _download_aria2(url: str, dest_dir: str, threads: int, resume: bool,
         raise DownloadError("aria2c 未安装")
 
 
-def download(url: str, dest_dir: str = ".", threads: int = 16, chunk_size: int = 0,
+def download(url: str, dest_dir: str = ".", threads: int = 128, chunk_size: int = 0,
              resume: bool = True, engine: str = "native", timeout: int = DEFAULT_TIMEOUT,
              stop: dict | None = None, headers: dict | None = None,
              proxy: str | None = None, limit_bps: float = 0.0,
