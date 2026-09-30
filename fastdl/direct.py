@@ -36,6 +36,8 @@ READ_TIMEOUT_FLOOR = 120    # 大文件 CDN 长连接允许短暂空闲，避免
 _SOCKET_OPTIONS = [
     (_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1),
     (_socket.SOL_SOCKET, _socket.SO_RCVBUF, 2 << 20),
+    (_socket.SOL_SOCKET, _socket.SO_SNDBUF, 2 << 20),
+    (_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1),
 ]
 
 
@@ -128,11 +130,20 @@ def _make_session(threads: int, source_ip: str | None = None,
     # 行为完全由参数决定，不偷偷使用环境变量里的代理（HTTPS_PROXY 等）
     s.trust_env = False
     bind_ip = source_ip
+    if not bind_ip and not proxy:
+        # 自动锁定当前系统默认物理出口，避免多网卡时下载流量走错接口。
+        try:
+            from .netif import default_interface
+            default = default_interface()
+            bind_ip = default.get("ip") if default else None
+        except Exception:  # noqa: BLE001
+            bind_ip = None
     if bind_ip and proxy and _is_loopback(proxy):
         # 本地代理必须走回环：源地址绑到物理网卡会连不上（WinError 10049）
         bind_ip = None
     retry = _build_retry()
-    adapter = _FastAdapter(bind_ip, pool_maxsize=threads + 8, pool_connections=threads + 8,
+    pool_size = max(threads + 16, 256)
+    adapter = _FastAdapter(bind_ip, pool_maxsize=pool_size, pool_connections=pool_size,
                            max_retries=retry if retry is not None else 0)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
