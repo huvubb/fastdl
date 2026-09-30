@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections import deque
 
 from .utils import human_bytes, human_eta, human_rate
 
@@ -24,6 +25,7 @@ class SingleLineProgress:
         self._t0 = time.time()
         self._last_done = 0.0
         self._last_t = self._t0
+        self._samples: deque[tuple[float, int]] = deque()
 
     def add(self, delta: int, rate_key: str | None = None, rate_val: float = 0.0):
         self.done += delta
@@ -32,10 +34,14 @@ class SingleLineProgress:
 
     def _rate(self) -> float:
         now = time.time()
-        dt = now - self._last_t
-        if dt <= 0:
-            return 0.0
-        r = (self.done - self._last_done) / dt
+        # 用滑动窗口，避免 CDN 分块到达间隔稍长时速度瞬间跳成 0B/s。
+        self._samples.append((now, self.done))
+        cutoff = now - 3.0
+        while len(self._samples) > 1 and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        t0, d0 = self._samples[0]
+        dt = now - t0
+        r = (self.done - d0) / dt if dt > 0 else 0.0
         self._last_done = self.done
         self._last_t = now
         return r
@@ -48,10 +54,12 @@ class SingleLineProgress:
         rate = self._rate()
         eta = (self.total - self.done) / rate if rate > 0 else None
         bar_w = 22
-        filled = int(bar_w * pct / 100)
-        # 用 ASCII 块，避免 GBK 控制台编码错误（Windows 中文系统默认 GBK）
-        bar = "#" * filled + "-" * (bar_w - filled)
-        line = f"{self.label}{bar} {pct:5.1f}%  {human_bytes(self.done)}/{human_bytes(self.total)}  "
+        # 方括号进度条，中间固定显示百分比，兼容 Windows 控制台编码。
+        inner = max(8, bar_w - 8)
+        filled = int(inner * pct / 100)
+        bar = "=" * filled + " " * (inner - filled)
+        line = f"{self.label}[{bar[:inner//2]} {pct:5.1f}% {bar[inner//2:]}]  "
+        line += f"{human_bytes(self.done)}/{human_bytes(self.total)}  "
         line += f"{human_rate(rate)}  ETA {human_eta(eta)}"
         if self.detail_names:
             parts = [f"{n}:{human_rate(self.rates.get(n, 0.0))}"

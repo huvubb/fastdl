@@ -30,6 +30,7 @@ MIN_CHUNK = 1 << 20   # 1 MiB（下限）
 DEFAULT_TIMEOUT = 30
 MAX_CHUNK_RETRIES = 8      # 分片级重试（断流后从已写入部分续传）
 MAX_CONNECT_RETRIES = 4    # 单次请求的连接重试（GFW/代理重置时换新连接重试）
+READ_TIMEOUT_FLOOR = 120    # 大文件 CDN 长连接允许短暂空闲，避免过早断线
 
 # socket 调优：小分片请求对延迟敏感 → Nagle 必须关；接收缓冲加大提升大带宽吞吐
 _SOCKET_OPTIONS = [
@@ -176,7 +177,9 @@ def _get_with_retry(session: requests.Session, url: str, headers: dict, timeout:
     last: Exception | None = None
     for i in range(attempts):
         try:
-            return session.get(url, headers=headers, timeout=(timeout, timeout), stream=stream)
+            return session.get(url, headers=headers,
+                               timeout=(timeout, max(timeout, READ_TIMEOUT_FLOOR)),
+                               stream=stream)
         except requests.RequestException as e:
             last = e
             if i < attempts - 1:
