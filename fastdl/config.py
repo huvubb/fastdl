@@ -14,7 +14,7 @@ class Config:
     userhash: bytes = b""                     # 身份标识，urandom(16) 生成一次并持久化
     tcp_port: int = 4662                      # 广告端口（不监听也能查源）
     servers: list[tuple[str, int]] = field(default_factory=list)
-    threads: int = 32
+    threads: int = 64
     max_sources: int = 6
     download_dir: str = ""                    # 交互模式的默认下载目录（记住上次用的）
     iface_ip: str = ""                        # 选中的下载网卡 IP（空=自动/跟随系统）
@@ -34,7 +34,7 @@ def load_config(path: str | None = None) -> Config:
         if isinstance(data.get("userhash"), str) and len(data["userhash"]) == 32:
             cfg.userhash = bytes.fromhex(data["userhash"])
         cfg.tcp_port = int(data.get("tcp_port", 4662))
-        cfg.threads = int(data.get("threads", 32))
+        cfg.threads = int(data.get("threads", 64))
         cfg.max_sources = int(data.get("max_sources", 6))
         cfg.servers = [tuple(s) for s in data.get("servers", [])]
         cfg.download_dir = str(data.get("download_dir", ""))
@@ -63,3 +63,4 @@ def save_config(cfg: Config, path: str | None = None) -> None:
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+

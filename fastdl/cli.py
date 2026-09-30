@@ -382,50 +382,35 @@ def _menu_download(cfg) -> None:
 
 
 def _interactive(cfg) -> int:
-    """无参数启动：菜单式界面，全程数字选择，不用记任何参数。"""
+    """无参数启动：直接粘贴链接下载，不显示菜单。"""
     print("=" * 56)
     print(f"  fastdl {__version__} —— 多线程直链 + ed2k 下载器")
-    print("  菜单操作，不用记参数")
+    print("  高速模式：自动分片、重试、断点续传")
     print("=" * 56)
     if not cfg.download_dir:
         cfg.download_dir = default_download_dir()
+        save_config(cfg)
     os.makedirs(cfg.download_dir, exist_ok=True)
-
+    iface = f"{cfg.iface_name} ({cfg.iface_ip})" if cfg.iface_ip else "系统默认网卡"
+    print(f"下载目录：{cfg.download_dir}")
+    print(f"下载网卡：{iface}")
+    print(f"并行线程：{cfg.threads}")
+    print("直接粘贴下载链接并回车；输入 q 退出。")
     while True:
-        iface = f"{cfg.iface_name} ({cfg.iface_ip})" if cfg.iface_ip else "自动（跟随系统）"
-        print(f"\n下载目录：{cfg.download_dir}")
-        print(f"下载网卡：{iface}")
-        print("  [1] 下载（粘贴链接）")
-        print("  [2] 选择下载网卡")
-        print("  [3] 清理无效连接")
-        print("  [4] 查看网络连接")
-        print("  [5] 修改下载目录")
-        print("  [6] 设置线程数")
-        print("  [0] 退出")
-        sel = _ask("请选择：")
-        if sel is None:
+        line = _ask("> ")
+        if line is None or line.strip().lower() in ("q", "quit", "exit", "退出"):
             break
-        sel = sel.strip()
-        if sel == "1":
-            _menu_download(cfg)
-        elif sel == "2":
-            _pick_iface(cfg)
-        elif sel == "3":
-            _clear_conns()
-        elif sel == "4":
-            _show_conns()
-        elif sel == "5":
-            _set_dir(cfg)
-        elif sel == "6":
-            _set_threads(cfg)
-        elif sel in ("0", "q", "quit", "exit", "退出"):
-            break
-        elif sel:
-            print("  无效选择，请输入数字。")
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            print(f"\n[开始下载] {line}")
+            rc = _download_link(line, cfg.download_dir, cfg, cfg.iface_ip or None)
+            print("[完成]" if rc == 0 else "[未完成，已保存 .fastdl，可重新运行续传]")
+        except Exception as e:
+            print(f"[下载出错] {e}")
     print("\n已退出，下次见！")
     return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -443,3 +428,4 @@ def main(argv: list[str] | None = None) -> int:
         if os.environ.get("FASTDL_DEBUG"):
             raise
         return 2
+
