@@ -30,7 +30,7 @@ MIN_CHUNK = 4 << 20    # 4 MiB（减少小分片请求开销）
 DEFAULT_TIMEOUT = 30
 MAX_CHUNK_RETRIES = 8      # 分片级重试（断流后从已写入部分续传）
 MAX_CONNECT_RETRIES = 4    # 单次请求的连接重试（GFW/代理重置时换新连接重试）
-READ_TIMEOUT_FLOOR = 120    # 大文件 CDN 长连接允许短暂空闲，避免过早断线
+READ_TIMEOUT_FLOOR = 30     # 卡住的 CDN 分片及时释放，避免占满并发导致 0B/s
 
 # socket 调优：小分片请求对延迟敏感 → Nagle 必须关；接收缓冲加大提升大带宽吞吐
 _SOCKET_OPTIONS = [
@@ -102,35 +102,6 @@ class RateLimiter:
             time.sleep(delay)
             with self._lock:
                 self._last = time.monotonic()
-
-
-class AdaptiveConcurrency:
-    """允许下载过程中逐级降低并发，避免 CDN 对高并发 Range 限速。"""
-
-    def __init__(self, target: int):
-        self.target = max(1, target)
-        self.active = 0
-        self._cv = threading.Condition()
-
-    def acquire(self) -> None:
-        with self._cv:
-            while self.active >= self.target:
-                self._cv.wait()
-            self.active += 1
-
-    def release(self) -> None:
-        with self._cv:
-            self.active -= 1
-            self._cv.notify_all()
-
-    def reduce(self) -> int | None:
-        with self._cv:
-            new = 64 if self.target > 64 else 32 if self.target > 32 else self.target
-            if new == self.target:
-                return None
-            self.target = new
-            self._cv.notify_all()
-            return new
 
 
 @dataclass
@@ -501,9 +472,6 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
           + ("（已启用重定向直链）" if pr.final_url else ""))
 
     progress = SingleLineProgress(pr.size, label=f"{fn} ")
-    concurrency = AdaptiveConcurrency(threads)
-    best_rate = 0.0
-    slow_ticks = 0
     # 各线程速率暂不显示（聚合速率已覆盖），避免显示 0B/s
 
     def worker(i):
@@ -518,7 +486,6 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                 return
             use = urls[min(attempt // 2, len(urls) - 1)]
             try:
-                concurrency.acquire()
                 _fetch_chunk(use, i, pr.size, chunk_size, session, resume, timeout,
                              progress, stop, workdir, dlmeta_path,
                              headers=headers, limiter=limiter)
@@ -526,9 +493,6 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             except DownloadError as e:
                 last = e
                 time.sleep(min(1 * (2 ** attempt), 15))
-            finally:
-                if concurrency.active > 0:
-                    concurrency.release()
         if stop.get("flag"):
             return
         # 不抛出：保留其它分片进度，整块标记为未完成 → 返回 1 可续传
@@ -539,19 +503,6 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             futs = [ex.submit(worker, i) for i in range(n_chunks)]
             while True:
                 progress.paint()
-                rate = progress.current_rate
-                if rate > best_rate:
-                    best_rate = rate
-                    slow_ticks = 0
-                elif best_rate >= 10 << 20 and rate < best_rate * 0.55:
-                    slow_ticks += 1
-                    if slow_ticks >= 8:
-                        new_target = concurrency.reduce()
-                        if new_target:
-                            print(f"\n检测到 CDN 限速，自动降并发至 {new_target} 线程")
-                        slow_ticks = 0
-                else:
-                    slow_ticks = 0
                 if stop.get("flag"):
                     ex.shutdown(cancel_futures=True)
                     break
