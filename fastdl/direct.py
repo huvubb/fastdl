@@ -48,7 +48,9 @@ def _auto_chunk_size(size: int, threads: int) -> int:
     want = max(1, threads * 2)          # 每线程约 2 块，优先吞吐，减少请求开销
     cs = size // want
     cs = max(MIN_CHUNK, min(CHUNK_SIZE, cs))
-    return max(MIN_CHUNK, (cs // MIN_CHUNK) << 20)
+    # cs 已经是字节数；这里必须乘以 MIN_CHUNK，不能再次左移 20 位。
+    # 例如目标约 16MiB 时，错误写法会把它压成 4MiB。
+    return max(MIN_CHUNK, (cs // MIN_CHUNK) * MIN_CHUNK)
 
 
 class DownloadError(Exception):
@@ -297,7 +299,7 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
             raise DownloadError(f"chunk {index} HTTP {r.status_code}")
         mode = "ab" if (resume and existing > 0) else "wb"
         got = 0
-        with open(part_path, mode) as f:
+        with open(part_path, mode, buffering=8 << 20) as f:
             # iter_content 会把底层的断流/解码异常抛出；不能把一次短读误判为 EOF。
             for b in r.iter_content(chunk_size=1 << 20):
                 if stop.get("flag"):
@@ -336,13 +338,13 @@ def _cleanup_workdir(workdir: str) -> None:
 
 def _merge(dest: str, workdir: str, n_chunks: int, size: int, progress=None) -> None:
     """按索引顺序把 .part.<i> 流式合并进最终文件，拷完即删。"""
-    with open(dest, "wb") as out:
+    with open(dest, "wb", buffering=8 << 20) as out:
         done = 0
         for i in range(n_chunks):
             src = _part_path(workdir, i)
             if not os.path.exists(src):
                 raise DownloadError(f"合并时缺少 .part.{i}")
-            with open(src, "rb") as f:
+            with open(src, "rb", buffering=8 << 20) as f:
                 while True:
                     b = f.read(1 << 20)
                     if not b:
