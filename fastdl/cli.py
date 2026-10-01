@@ -72,6 +72,7 @@ def _cmd_direct(args) -> int:
         headers=_parse_headers(args),
         proxy=args.proxy,
         limit_bps=parse_limit(args.limit),
+        source_ip=cfg.iface_ip or None,
     )
     return rc
 
