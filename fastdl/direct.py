@@ -25,11 +25,11 @@ from requests.adapters import HTTPAdapter
 from .progress import SingleLineProgress
 from .utils import disk_free, sanitize_filename
 
-CHUNK_SIZE = 16 << 20  # 16 MiB（高吞吐上限；按文件大小/线程数自适应）
-MIN_CHUNK = 4 << 20    # 4 MiB（减少小分片请求开销）
+CHUNK_SIZE = 64 << 20  # 64 MiB（高吞吐上限；按文件大小/线程数自适应）
+MIN_CHUNK = 16 << 20   # 16 MiB（减少 Xet/CDN 请求与握手开销）
 DEFAULT_TIMEOUT = 30
-MAX_CHUNK_RETRIES = 8      # 分片级重试（断流后从已写入部分续传）
-MAX_CONNECT_RETRIES = 4    # 单次请求的连接重试（GFW/代理重置时换新连接重试）
+MAX_CHUNK_RETRIES = 4      # 限制故障连接占用时间，失败后保留进度供续传
+MAX_CONNECT_RETRIES = 2    # 连接失败快速重试，避免多层退避叠加
 READ_TIMEOUT_FLOOR = 30     # 卡住的 CDN 分片及时释放，避免占满并发导致 0B/s
 
 # socket 调优：小分片请求对延迟敏感 → Nagle 必须关；接收缓冲加大提升大带宽吞吐
@@ -45,7 +45,7 @@ def _auto_chunk_size(size: int, threads: int) -> int:
     """按文件大小/线程数自适应分片：块太多太小→开销大，太少→并行度不足。"""
     if size <= 0:
         return CHUNK_SIZE
-    want = max(1, threads * 2)          # 每线程约 2 块，优先吞吐，减少请求开销
+    want = max(1, threads)              # 约每线程 1 块，减少请求与 TLS 握手开销
     cs = size // want
     cs = max(MIN_CHUNK, min(CHUNK_SIZE, cs))
     # cs 已经是字节数；这里必须乘以 MIN_CHUNK，不能再次左移 20 位。
@@ -67,8 +67,9 @@ def _build_retry():
         from urllib3.util.retry import Retry
     except ImportError:
         return None
-    kw = dict(total=4, connect=4, read=0, status=4, backoff_factor=0.5,
-              status_forcelist=(429, 500, 502, 503, 504), raise_on_status=False)
+    # 统一由 _get_with_retry / 分片层重试，禁用 urllib3 内部重试避免退避叠加。
+    kw = dict(total=0, connect=0, read=0, status=0, backoff_factor=0,
+              status_forcelist=(), raise_on_status=False)
     try:
         return Retry(allowed_methods=frozenset(["GET", "HEAD"]), **kw)
     except TypeError:  # urllib3 < 1.26
@@ -191,12 +192,12 @@ def _get_with_retry(session: requests.Session, url: str, headers: dict, timeout:
     for i in range(attempts):
         try:
             return session.get(url, headers=headers,
-                               timeout=(timeout, max(timeout, READ_TIMEOUT_FLOOR)),
+                               timeout=(min(timeout, 10), max(timeout, READ_TIMEOUT_FLOOR)),
                                stream=stream)
         except requests.RequestException as e:
             last = e
             if i < attempts - 1:
-                time.sleep(min(0.8 * (2 ** i), 8))
+                time.sleep(min(0.25 * (2 ** i), 0.5))
     raise DownloadError(f"连接失败（已重试 {attempts} 次）: {last}")
 
 
@@ -301,7 +302,7 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
         got = 0
         with open(part_path, mode, buffering=8 << 20) as f:
             # iter_content 会把底层的断流/解码异常抛出；不能把一次短读误判为 EOF。
-            for b in r.iter_content(chunk_size=1 << 20):
+            for b in r.iter_content(chunk_size=4 << 20):
                 if stop.get("flag"):
                     raise DownloadError("已停止")
                 if not b:
@@ -494,7 +495,9 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                 return
             except DownloadError as e:
                 last = e
-                time.sleep(min(1 * (2 ** attempt), 15))
+                if attempt == 0:
+                    print(f"\n分片 {i} 首次请求失败，快速重连: {e}", flush=True)
+                time.sleep(min(0.25 * (2 ** attempt), 1.0))
         if stop.get("flag"):
             return
         # 不抛出：保留其它分片进度，整块标记为未完成 → 返回 1 可续传
