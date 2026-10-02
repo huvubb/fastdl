@@ -4,7 +4,7 @@
 - 权威探针 = GET `Range: bytes=0-0`：206+Content-Range 判定分片支持并拿总长；
   200 说明服务器无视 Range → 单线程流式回退。
 - 必须 `Accept-Encoding: identity`，否则透明 gzip 会破坏字节偏移。
-- 固定 8MiB chunk，chunk 边界与线程数解耦；`.part.<i>` 文件大小即进度。
+- 64~128MiB 自适应 chunk，减少大文件的 Range 请求轮换；`.part.<i>` 文件大小即进度。
 - 续传：`.dlmeta` 记录 url/size/etag/chunk_size/n_chunks，ETag 变了清空重来。
 - 合并按索引顺序流式拷贝，拷完即删 .part → 峰值磁盘 ≈ 最终文件 + 最大一块。
 """
@@ -25,12 +25,12 @@ from requests.adapters import HTTPAdapter
 from .progress import SingleLineProgress
 from .utils import disk_free, sanitize_filename
 
-CHUNK_SIZE = 64 << 20  # 64 MiB（高吞吐上限；按文件大小/线程数自适应）
-MIN_CHUNK = 16 << 20   # 16 MiB（减少 Xet/CDN 请求与握手开销）
+CHUNK_SIZE = 128 << 20 # 128 MiB（减少大型下载的请求轮换）
+MIN_CHUNK = 64 << 20   # 64 MiB（避免小分片造成大量并发 Range 请求）
 DEFAULT_TIMEOUT = 30
 MAX_CHUNK_RETRIES = 4      # 限制故障连接占用时间，失败后保留进度供续传
 MAX_CONNECT_RETRIES = 2    # 连接失败快速重试，避免多层退避叠加
-READ_TIMEOUT_FLOOR = 30     # 卡住的 CDN 分片及时释放，避免占满并发导致 0B/s
+READ_TIMEOUT_CAP = 15        # 无数据时最多等 15 秒，及时释放卡住的 CDN 分片
 
 # socket 调优：小分片请求对延迟敏感 → Nagle 必须关；接收缓冲加大提升大带宽吞吐
 _SOCKET_OPTIONS = [
@@ -192,7 +192,7 @@ def _get_with_retry(session: requests.Session, url: str, headers: dict, timeout:
     for i in range(attempts):
         try:
             return session.get(url, headers=headers,
-                               timeout=(min(timeout, 10), max(timeout, READ_TIMEOUT_FLOOR)),
+                               timeout=(min(timeout, 10), min(timeout, READ_TIMEOUT_CAP)),
                                stream=stream)
         except requests.RequestException as e:
             last = e
@@ -392,13 +392,19 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         except (OSError, json.JSONDecodeError):
             meta = None
     if meta:
-        # chunk_size 必须一致，否则 .part.<i> 与字节区间的映射会错位
-        if (meta.get("url") != url or meta.get("size") != pr.size
-                or meta.get("etag") != pr.etag or meta.get("chunk_size") != chunk_size):
+        same_file = (meta.get("url") == url and meta.get("size") == pr.size
+                     and meta.get("etag") == pr.etag)
+        if not same_file:
             for f in os.listdir(workdir):
                 if f.startswith(".part."):
                     os.remove(os.path.join(workdir, f))
             meta = None
+        else:
+            # 分片索引由 chunk_size 决定。保留旧布局续传，避免升级时清掉已有下载量。
+            old_chunk_size = int(meta.get("chunk_size") or 0)
+            if old_chunk_size > 0 and old_chunk_size != chunk_size:
+                print(f"沿用未完成下载的 {old_chunk_size >> 20}MiB 分片布局，保留已有进度")
+                chunk_size = old_chunk_size
 
     # 已完整下载过 → 直接跳过
     if (resume and meta is not None and pr.size > 0
