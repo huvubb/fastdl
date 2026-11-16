@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from urllib.parse import urlsplit
 
 from . import __version__
 from .config import load_config, save_config
@@ -46,6 +47,20 @@ def _parse_headers(args) -> dict | None:
     return out or None
 
 
+def _cfg_proxy_for(url: str, cfg_proxy: str | None) -> str | None:
+    """配置中的代理对回环/本机地址自动旁路（代理通常无法回环转发本机服务）；
+    用户显式传的 --proxy 不旁路（显式指定 = 明确要求）。"""
+    if not cfg_proxy:
+        return None
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return cfg_proxy
+    if host in ("localhost", "::1") or host.startswith("127."):
+        return None
+    return cfg_proxy
+
+
 def _cmd_direct(args) -> int:
     from .direct import download
     from .config import load_config
@@ -70,9 +85,10 @@ def _cmd_direct(args) -> int:
         timeout=args.timeout,
         stop=stop,
         headers=_parse_headers(args),
-        proxy=args.proxy,
+        proxy=args.proxy or _cfg_proxy_for(args.url, cfg.proxy),
         limit_bps=parse_limit(args.limit),
         source_ip=cfg.iface_ip or None,
+        gh_accel=cfg.gh_accel,
     )
     return rc
 
@@ -185,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("direct", help="多线程直链下载")
     d.add_argument("url")
-    d.add_argument("-t", "--threads", type=int, default=0, help="线程数（默认 128，速度优先）")
+    d.add_argument("-t", "--threads", type=int, default=0, help="线程数（默认 64，1~512）")
     d.add_argument("-o", "--output", default=".", help="保存目录")
     d.add_argument("--no-resume", action="store_true", help="禁用断点续传")
     d.add_argument("--engine", choices=["native", "aria2"], default="native",
@@ -220,7 +236,8 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _download_link(link: str, dest_dir: str, cfg, source_ip: str | None = None) -> int:
+def _download_link(link: str, dest_dir: str, cfg, source_ip: str | None = None,
+                   proxy: str | None = None) -> int:
     """按链接类型分发下载。返回：0 完成，1 部分/可续传，2 失败。"""
     low = link.lower()
     if low.startswith("ed2k://"):
@@ -238,7 +255,8 @@ def _download_link(link: str, dest_dir: str, cfg, source_ip: str | None = None) 
         return dl.run()
     if low.startswith(("http://", "https://", "ftp://")):
         from .direct import download
-        return download(link, dest_dir=dest_dir, threads=cfg.threads, source_ip=source_ip)
+        return download(link, dest_dir=dest_dir, threads=cfg.threads, source_ip=source_ip,
+                        proxy=_cfg_proxy_for(link, proxy), gh_accel=cfg.gh_accel)
     raise ValueError(f"无法识别的链接类型: {link[:60]}")
 
 
@@ -371,7 +389,8 @@ def _menu_download(cfg) -> None:
             return
         try:
             print(f"\n[开始下载] {line}")
-            rc = _download_link(line, cfg.download_dir, cfg, cfg.iface_ip or None)
+            rc = _download_link(line, cfg.download_dir, cfg, cfg.iface_ip or None,
+                                proxy=cfg.proxy or None)
             if rc == 0:
                 print("[完成]")
             elif rc == 1:
@@ -382,8 +401,60 @@ def _menu_download(cfg) -> None:
             print(f"[下载出错] {e}")
 
 
+def _set_proxy(cfg, line: str) -> None:
+    """交互模式内开关代理：proxy <url> 开启并持久化，proxy off 恢复直连。"""
+    arg = line.split(None, 1)[1].strip() if len(line.split(None, 1)) > 1 else ""
+    if not arg or arg.lower() in ("off", "none", "直连", "关闭"):
+        cfg.proxy = ""
+        save_config(cfg)
+        print("  已恢复直连。")
+        return
+    if "://" not in arg:
+        print("  格式应为 proxy http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+        return
+    cfg.proxy = arg
+    save_config(cfg)
+    print(f"  代理已设为 {arg} 并保存（proxy off 可关闭）")
+
+
+def _menu(cfg) -> None:
+    """设置菜单：粘贴链接之外的选项（网卡、连接、目录、线程）。"""
+    while True:
+        iface = f"{cfg.iface_name} ({cfg.iface_ip})" if cfg.iface_ip else "自动（跟随系统）"
+        print(f"\n下载目录：{cfg.download_dir}")
+        print(f"下载网卡：{iface}")
+        print(f"并行线程：{cfg.threads}")
+        print("  [1] 下载（粘贴链接）")
+        print("  [2] 选择下载网卡")
+        print("  [3] 清理无效连接")
+        print("  [4] 查看网络连接")
+        print("  [5] 修改下载目录")
+        print("  [6] 设置线程数")
+        print("  [0] 返回下载")
+        sel = _ask("请选择：")
+        if sel is None:
+            return
+        sel = sel.strip()
+        if sel == "1":
+            _menu_download(cfg)
+        elif sel == "2":
+            _pick_iface(cfg)
+        elif sel == "3":
+            _clear_conns()
+        elif sel == "4":
+            _show_conns()
+        elif sel == "5":
+            _set_dir(cfg)
+        elif sel == "6":
+            _set_threads(cfg)
+        elif sel in ("0", "q", "quit", "exit", "退出"):
+            return
+        elif sel:
+            print("  无效选择，请输入数字。")
+
+
 def _interactive(cfg) -> int:
-    """无参数启动：直接粘贴链接下载，不显示菜单。"""
+    """无参数启动：直接粘贴链接下载；输入 menu 打开设置菜单。"""
     print("=" * 56)
     print(f"  fastdl {__version__} —— 多线程直链 + ed2k 下载器")
     print("  高速模式：自动分片、重试、断点续传")
@@ -396,7 +467,8 @@ def _interactive(cfg) -> int:
     print(f"下载目录：{cfg.download_dir}")
     print(f"下载网卡：{iface}")
     print(f"并行线程：{cfg.threads}")
-    print("直接粘贴下载链接并回车；输入 q 退出。")
+    print(f"下载代理：{cfg.proxy or '直连（境外慢可输入 proxy http://127.0.0.1:7890 开启）'}")
+    print("直接粘贴下载链接并回车；menu=设置菜单，q=退出。")
     while True:
         line = _ask("> ")
         if line is None or line.strip().lower() in ("q", "quit", "exit", "退出"):
@@ -404,14 +476,28 @@ def _interactive(cfg) -> int:
         line = line.strip()
         if not line:
             continue
+        low = line.lower()
+        if low in ("menu", "m", "设置", "菜单"):
+            _menu(cfg)
+            continue
+        if low == "proxy" or low.startswith("proxy "):
+            _set_proxy(cfg, line)
+            continue
         try:
             print(f"\n[开始下载] {line}")
-            rc = _download_link(line, cfg.download_dir, cfg, cfg.iface_ip or None)
-            print("[完成]" if rc == 0 else "[未完成，已保存 .fastdl，可重新运行续传]")
+            rc = _download_link(line, cfg.download_dir, cfg, cfg.iface_ip or None,
+                                proxy=cfg.proxy or None)
+            if rc == 0:
+                print("[完成]")
+            elif rc == 2:
+                print("[失败] 请检查链接或网络。")
+            else:
+                print("[未完成] 已保存 .fastdl，重新运行可续传。")
         except Exception as e:
             print(f"[下载出错] {e}")
     print("\n已退出，下次见！")
     return 0
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]

@@ -4,14 +4,17 @@
 - 权威探针 = GET `Range: bytes=0-0`：206+Content-Range 判定分片支持并拿总长；
   200 说明服务器无视 Range → 单线程流式回退。
 - 必须 `Accept-Encoding: identity`，否则透明 gzip 会破坏字节偏移。
-- 64~128MiB 自适应 chunk，减少大文件的 Range 请求轮换；`.part.<i>` 文件大小即进度。
+- 4~128MiB 自适应 chunk：CDN 按单连接限速时（GitHub ~400KB/s/连接），
+  分片越细、并行连接越多、聚合带宽越高；`.part.<i>` 文件大小即进度。
 - 续传：`.dlmeta` 记录 url/size/etag/chunk_size/n_chunks，ETag 变了清空重来。
 - 合并按索引顺序流式拷贝，拷完即删 .part → 峰值磁盘 ≈ 最终文件 + 最大一块。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import socket as _socket
 import threading
 import time
@@ -26,11 +29,31 @@ from .progress import SingleLineProgress
 from .utils import disk_free, sanitize_filename
 
 CHUNK_SIZE = 128 << 20 # 128 MiB（减少大型下载的请求轮换）
-MIN_CHUNK = 64 << 20   # 64 MiB（避免小分片造成大量并发 Range 请求）
+MIN_CHUNK = 4 << 20    # 4 MiB（GitHub 等按单连接限速的 CDN，必须靠更多连接聚合带宽；
+                       #  每块仍 >=4MiB，请求数不失控，且分片请求可复用 keep-alive 连接）
 DEFAULT_TIMEOUT = 30
 MAX_CHUNK_RETRIES = 4      # 限制故障连接占用时间，失败后保留进度供续传
 MAX_CONNECT_RETRIES = 2    # 连接失败快速重试，避免多层退避叠加
 READ_TIMEOUT_CAP = 15        # 无数据时最多等 15 秒，及时释放卡住的 CDN 分片
+
+# ---------- GitHub 直连加速 ----------
+# GitHub 直连国际链路常被 QoS（实测 0~4MB/s 随机抖动），纯多线程无解；
+# 用公益加速镜像（URL 前缀代理）直连可达 10~20MB/s。节点会轮换，竞速动态选优。
+_GH_HOSTS = {"github.com", "codeload.github.com", "raw.githubusercontent.com",
+             "gist.githubusercontent.com", "objects.githubusercontent.com"}
+_GH_MIRRORS = [
+    "https://edgeone.gh-proxy.org",   # 国内 EdgeOne 优选，实测 20MB+/s
+    "https://gh-proxy.org",
+    "https://v6.gh-proxy.org",
+    "https://ghfast.top",
+    "https://ghproxy.net",
+    "https://gh-proxy.com",
+]
+_GH_PROBE_BYTES = 1 << 20    # 竞速探测每节点拉 1MiB（再小会被 TLS 握手开销带偏）
+_GH_PROBE_BUDGET = 3.0       # 单节点探测超时（秒）
+_GH_RACE_BUDGET = 4.0        # 竞速总预算（秒）
+_GH_PROBE_GOOD = 3.0         # 已有节点 >=3MB/s 就提前收工（MB/s）
+_GH_CACHE_TTL = 7 * 86400    # 选中的镜像缓存 7 天，避免每次下载都重赛
 
 # socket 调优：小分片请求对延迟敏感 → Nagle 必须关；接收缓冲加大提升大带宽吞吐
 _SOCKET_OPTIONS = [
@@ -51,6 +74,127 @@ def _auto_chunk_size(size: int, threads: int) -> int:
     # cs 已经是字节数；这里必须乘以 MIN_CHUNK，不能再次左移 20 位。
     # 例如目标约 16MiB 时，错误写法会把它压成 4MiB。
     return max(MIN_CHUNK, (cs // MIN_CHUNK) * MIN_CHUNK)
+
+
+def _is_github_url(url: str) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return host in _GH_HOSTS
+
+
+def _gh_cache_path() -> str:
+    base = os.path.join(os.path.expanduser("~"), ".fastdl")
+    return os.path.join(base, "gh_mirror.json")
+
+
+def _load_mirror_cache() -> str | None:
+    """读上次竞速选中的镜像前缀（带 TTL），命中可省掉整轮竞速。"""
+    try:
+        with open(_gh_cache_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if time.time() - float(data.get("ts", 0)) > _GH_CACHE_TTL:
+            return None
+        prefix = str(data.get("mirror") or "")
+        return prefix or None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _save_mirror_cache(prefix: str) -> None:
+    try:
+        p = _gh_cache_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"mirror": prefix, "ts": time.time()}, f)
+    except OSError:
+        pass
+
+
+def _probe_one(mu: str, source_ip: str | None, results: dict[str, float],
+               lock: threading.Lock, good: threading.Event) -> None:
+    """探测单个候选：必须支持 Range(206)，把 bytes/s 写进 results。"""
+    s: requests.Session | None = None
+    try:
+        s = _make_session(2, source_ip=source_ip)
+        t0 = time.monotonic()
+        r = s.get(mu, headers={"Accept-Encoding": "identity",
+                               "Range": f"bytes=0-{_GH_PROBE_BYTES - 1}"},
+                  timeout=(3, int(_GH_PROBE_BUDGET)), stream=True)
+        if r.status_code != 206:   # 必须支持 Range，否则无法分片下载
+            r.close()
+            return
+        got = 0
+        for b in r.iter_content(64 << 10):
+            got += len(b)
+            if got >= _GH_PROBE_BYTES:
+                break
+        r.close()
+        dt = time.monotonic() - t0
+        if dt > 0 and got > 0:
+            rate = got / dt
+            with lock:
+                results[mu] = rate
+            if rate >= _GH_PROBE_GOOD * 1e6:
+                good.set()      # 够快了，不必等慢节点
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _race_github_mirror(url: str, source_ip: str | None = None
+                        ) -> tuple[list[str], float] | None:
+    """并行竞速 GitHub 加速镜像，返回按速度排好序的候选链（含直连兜底）。
+
+    返回 (候选URL列表, 最块节点MB/s)；全不可用返回 None。
+    命中缓存时缓存节点排第一，否则全节点竞速（<=4s，找到快节点提前收工）。
+    注意：探测值受握手延迟影响，普遍低于实际吞吐，因此只作相对排序用，
+    真正的取舍放在下面的判定里——直连已死时任何活镜像都值得用。
+    """
+    cached = _load_mirror_cache()
+    cands = [f"{cached}/{url}"] if cached else []
+    cands += [f"{m}/{url}" for m in _GH_MIRRORS if m != cached] + [url]
+
+    results: dict[str, float] = {}
+    lock = threading.Lock()
+    good = threading.Event()
+    ths = [threading.Thread(target=_probe_one, args=(m, source_ip, results, lock, good),
+                            daemon=True) for m in cands]
+    for t in ths:
+        t.start()
+    # 全局截止时间：所有 join 共享预算；任一节点达标就提前收工
+    deadline = time.monotonic() + _GH_RACE_BUDGET
+    for t in ths:
+        if good.is_set():
+            break
+        t.join(max(0.0, deadline - time.monotonic()))
+
+    with lock:
+        snapshot = dict(results)
+    if not snapshot:
+        return None
+    direct = snapshot.get(url, 0.0)
+    mirrors = sorted((u for u in snapshot if u != url), key=snapshot.get, reverse=True)
+    if not mirrors:
+        return None
+    best = mirrors[0]
+    best_rate = snapshot[best]
+    # 判定只做相对比较：探测值被 TLS 握手压低，绝对值不可靠。
+    # 直连已经死透(0)时任何活镜像都该上；直连很快(20MB/s)时镜像自然比不过。
+    if best_rate < max(256 << 10, direct * 1.2):
+        return None
+    prefix = best[: -len(url)].rstrip("/")
+    if prefix:
+        _save_mirror_cache(prefix)
+    # 候选链：最快镜像 → 其余活镜像 → 直连兜底。任何一环挂了自动降级。
+    chain = [u for u in mirrors if snapshot[u] >= 256 << 10] + [url]
+    return chain, best_rate / 1e6
 
 
 class DownloadError(Exception):
@@ -127,13 +271,22 @@ def _is_loopback(proxy: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+def _is_loopback_url(url: str) -> bool:
+    """目标是本机/回环地址时，不能把源地址绑到物理网卡（WinError 10049）。"""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
 def _make_session(threads: int, source_ip: str | None = None,
-                  proxy: str | None = None) -> requests.Session:
+                  proxy: str | None = None, auto_bind: bool = True) -> requests.Session:
     s = requests.Session()
     # 行为完全由参数决定，不偷偷使用环境变量里的代理（HTTPS_PROXY 等）
     s.trust_env = False
     bind_ip = source_ip
-    if not bind_ip and not proxy:
+    if not bind_ip and not proxy and auto_bind:
         # 自动锁定当前系统默认物理出口，避免多网卡时下载流量走错接口。
         try:
             from .netif import default_interface
@@ -214,7 +367,8 @@ def probe(url: str, threads: int = 16, timeout: int = DEFAULT_TIMEOUT,
           headers: dict | None = None, proxy: str | None = None,
           source_ip: str | None = None) -> ProbeResult:
     """权威探针：GET Range bytes=0-0。返回总长 + 是否支持分片 + 元数据。"""
-    s = _make_session(threads, source_ip=source_ip, proxy=proxy)
+    s = _make_session(threads, source_ip=source_ip, proxy=proxy,
+                      auto_bind=not _is_loopback_url(url))
     if proxy:
         s.proxies.update({"http": proxy, "https": proxy})
     h = {"Accept-Encoding": "identity"}
@@ -270,6 +424,12 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
     expect = end - start
     part_path = _part_path(workdir, index)
     existing = os.path.getsize(part_path) if resume and os.path.exists(part_path) else 0
+    if existing > expect:
+        # 上次异常退出留下了超量数据（如服务端多发了字节）：必须截断，
+        # 否则下面会把它当"已完成"，合并出来的文件是错的。
+        with open(part_path, "r+b") as f:
+            f.truncate(expect)
+        existing = expect
     if existing >= expect:
         return  # 已完成
 
@@ -300,7 +460,8 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
             raise DownloadError(f"chunk {index} HTTP {r.status_code}")
         mode = "ab" if (resume and existing > 0) else "wb"
         got = 0
-        with open(part_path, mode, buffering=8 << 20) as f:
+        # 缓冲别太大：>块大小时进度不落盘，中断会丢掉整块的已完成数据
+        with open(part_path, mode, buffering=1 << 20) as f:
             # iter_content 会把底层的断流/解码异常抛出；不能把一次短读误判为 EOF。
             for b in r.iter_content(chunk_size=4 << 20):
                 if stop.get("flag"):
@@ -359,21 +520,103 @@ def _merge(dest: str, workdir: str, n_chunks: int, size: int, progress=None) -> 
         raise DownloadError(f"合并后大小不符: {os.path.getsize(dest)} != {size}")
 
 
+def _has_secret_headers(headers: dict | None) -> bool:
+    """带鉴权/隐私的请求头绝不能发给第三方加速镜像。"""
+    if not headers:
+        return False
+    sensitive = ("authorization", "cookie", "x-api-key", "x-auth", "token", "private")
+    return any(k.lower() in sensitive or "token" in k.lower() or "auth" in k.lower()
+               for k in headers)
+
+
+def _github_expected_digest(url: str, headers: dict | None) -> str | None:
+    """查 GitHub release 资产的官方 sha256（api.github.com 提供的 digest）。
+
+    走第三方镜像时用它兜底：镜像再怎么不可信，哈希对不上我们就报错。
+    非 release 直链 / API 不可达时返回 None（跳过校验）。
+    """
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(.+)$", url)
+    if not m:
+        return None
+    owner, repo, tag, asset = m.groups()
+    try:
+        # 走 GitHub API 而不是镜像：这是校验基准，必须来自可信源
+        r = requests.get(f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}",
+                         timeout=(5, 10),
+                         headers={"User-Agent": "fastdl", "Accept": "application/vnd.github+json"})
+        if r.status_code != 200:
+            return None
+        for a in r.json().get("assets", []):
+            if a.get("name") == unquote(asset):
+                digest = a.get("digest") or ""
+                return digest.split(":", 1)[1] if digest.startswith("sha256:") else None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(4 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
 def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                      resume: bool, timeout: int, stop: dict, headers: dict | None = None,
                      proxy: str | None = None, limit_bps: float = 0.0,
-                     source_ip: str | None = None) -> int:
-    session = _make_session(threads, source_ip=source_ip, proxy=proxy)
+                     source_ip: str | None = None, gh_accel: bool = True) -> int:
+    # 回环目标（本机服务/测试服务器）不做网卡绑定，否则源地址不在目标网段直接 10049
+    if _is_loopback_url(url):
+        source_ip = None
+    session = _make_session(threads, source_ip=source_ip, proxy=proxy,
+                            auto_bind=not _is_loopback_url(url))
     limiter = RateLimiter(limit_bps) if limit_bps > 0 else None
-    try:
-        pr = probe(url, threads, timeout, headers=headers, proxy=proxy, source_ip=source_ip)
-    except DownloadError as e:
-        raise DownloadError(
-            f"{e}\n提示：境外站点（如 github）连接被重置/超时多为网络或代理问题——"
-            f"请确认加速器节点可用，或用 --proxy 指定可用代理；境内站点不受影响。"
-        ) from e
+    # GitHub 直连加速：先竞速选镜像（并行 512KiB 探测，~1~4s），选中后探针也走镜像，
+    # 彻底绕开直连链路的慢握手/重试；无合适节点则回退普通直连流程。
+    # 候选链：正常情况下就是 [url]；开了加速则是 [镜像1, 镜像2, ..., 直连]
+    chain: list[str] = []
+    if gh_accel and not proxy and _is_github_url(url):
+        if _has_secret_headers(headers):
+            # Cookie/Token 发到第三方镜像等于泄露账号，宁可不加速
+            print("检测到鉴权请求头，跳过镜像加速（避免泄露凭据）")
+        else:
+            raced = _race_github_mirror(url, source_ip=source_ip)
+            if raced:
+                chain, mbs = raced
+                print(f"GitHub 加速: 首选 {urlsplit(chain[0]).hostname}"
+                      f"（探测 {mbs:.1f}MB/s，共 {len(chain)} 个候选可自动降级）")
 
-    fetch_url = pr.final_url or url          # 直接打重定向后的真实地址，省一次 302 往返
+    # 探针沿候选链逐个尝试：某个镜像挂了自动换下一个，全挂才报错
+    pr = None
+    probed = url
+    probe_err: Exception | None = None
+    for cand in (chain or [url]):
+        try:
+            pr = probe(cand, threads, timeout, headers=headers, proxy=proxy, source_ip=source_ip)
+            probed = cand
+            break
+        except DownloadError as e:
+            probe_err = e
+            if cand != url:
+                print(f"节点 {urlsplit(cand).hostname} 探针失败，换下一个...")
+    if pr is None:
+        raise DownloadError(
+            f"探针失败: {probe_err}\n"
+            f"提示：境外站点（如 github）连接被重置/超时多为网络问题——"
+            f"可尝试 --proxy 指定可用代理，或稍后重试（镜像节点可能临时限流）；"
+            f"境内站点不受影响。"
+        )
+
+    if probed != url:
+        # 走镜像：用镜像前缀地址（镜像内部会处理跳转），不要直接打签名 CDN 直链
+        fetch_url = probed
+    else:
+        # 直连：优先打重定向后的真实地址，省掉每块一次 302
+        fetch_url = pr.final_url or url
+    # 候选链第一位必须是刚探通的地址，其余保持原顺序做降级
+    chain = [fetch_url] + [c for c in chain if c != fetch_url and c != probed]
     if chunk_size <= 0:
         chunk_size = _auto_chunk_size(pr.size, threads)
 
@@ -406,10 +649,13 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                 print(f"沿用未完成下载的 {old_chunk_size >> 20}MiB 分片布局，保留已有进度")
                 chunk_size = old_chunk_size
 
-    # 已完整下载过 → 直接跳过
-    if (resume and meta is not None and pr.size > 0
-            and os.path.exists(final) and os.path.getsize(final) == pr.size):
-        print(f"已存在完整文件，跳过: {final}")
+    # 已完整下载过 → 直接跳过。
+    # 注意：下完后 .fastdl 目录会被清掉（meta 为 None），所以不能只靠 meta 判断，
+    # 否则每次重跑同一个链接都会把几 GB 重新下一遍。
+    if (resume and pr.size > 0 and os.path.exists(final)
+            and os.path.getsize(final) == pr.size
+            and (meta is not None or not os.path.isdir(workdir))):
+        print(f"已存在完整文件（大小一致），跳过: {final}")
         _cleanup_workdir(workdir)
         return 0
 
@@ -427,24 +673,30 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         if (resume and os.path.exists(final) and os.path.getsize(final) == pr.size):
             return 0
         have = os.path.getsize(part_file) if (resume and os.path.exists(part_file)) else 0
-        for attempt in range(MAX_CHUNK_RETRIES):
+        urls = chain or [fetch_url]
+        retries = max(MAX_CHUNK_RETRIES, len(urls) * 2)
+        for attempt in range(retries):
             if stop.get("flag"):
                 return 1
+            use = urls[min(attempt // 2, len(urls) - 1)]
             h = {"Accept-Encoding": "identity"}
             if headers:
                 h.update(headers)
             if have > 0:
                 h["Range"] = f"bytes={have}-"
             try:
-                r = _get_with_retry(session, fetch_url, h, timeout)
+                r = _get_with_retry(session, use, h, timeout)
             except DownloadError as e:
-                if attempt == MAX_CHUNK_RETRIES - 1:
+                if attempt == retries - 1:
                     print(f"\n连接中断，进度已保留（.fastdl 文件续传）: {e}")
                     return 1
                 time.sleep(min(1 * (2 ** attempt), 15))
                 continue
             try:
-                mode = "ab" if (resume and have > 0 and r.status_code == 206) else "wb"
+                resume_ok = (resume and have > 0 and r.status_code == 206)
+                mode = "ab" if resume_ok else "wb"
+                if not resume_ok:
+                    have = 0      # 文件会被截断重写，进度必须归零，否则下次 Range 会跳数据
                 with open(part_file, mode) as f:
                     for b in r.iter_content(chunk_size=1 << 20):
                         if stop.get("flag"):
@@ -457,7 +709,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                         if limiter:
                             limiter.wait(len(b))
             except (requests.RequestException, OSError) as e:
-                if attempt == MAX_CHUNK_RETRIES - 1:
+                if attempt == retries - 1:
                     print(f"\n连接中断，进度已保留（.fastdl 文件续传）: {e}")
                     return 1
                 time.sleep(min(1 * (2 ** attempt), 15))
@@ -486,11 +738,15 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     def worker(i):
         if stop.get("flag"):
             return
-        # 优先用重定向后的直链（省 302）；若连续失败则回退到原始 URL
-        # （签名直链可能有时效或 CDN 限流，回退可保证长下载不中断）
-        urls = [fetch_url] if fetch_url == url else [fetch_url, url]
+        # 候选链逐级降级：[镜像1, 镜像2, ..., 直连]。
+        # 每个候选给 2 次机会，全挂才算这块失败（进度保留，重跑续传）。
+        urls = chain or [fetch_url]
+        if urls[0] != fetch_url:
+            urls = [fetch_url] + [u for u in urls if u != fetch_url]
         last = None
-        for attempt in range(MAX_CHUNK_RETRIES):
+        # 候选越多给的重试次数越多，保证每个候选都能轮到（每个 2 次机会）
+        retries = max(MAX_CHUNK_RETRIES, len(urls) * 2)
+        for attempt in range(retries):
             if stop.get("flag"):
                 return
             use = urls[min(attempt // 2, len(urls) - 1)]
@@ -529,17 +785,43 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     finally:
         progress.finish("")
 
-    complete = all(
-        os.path.getsize(_part_path(workdir, i)) >= (_chunk_range(i, chunk_size, pr.size)[1]
-                                                    - _chunk_range(i, chunk_size, pr.size)[0])
-        for i in range(n_chunks)
-    )
+    def _part_done(i: int) -> bool:
+        p = _part_path(workdir, i)
+        if not os.path.exists(p):      # 这块一次都没连上 → 未完成，不是错误
+            return False
+        start, end = _chunk_range(i, chunk_size, pr.size)
+        return os.path.getsize(p) >= (end - start)
+
+    complete = all(_part_done(i) for i in range(n_chunks))
     if not complete:
         return 1
 
     if os.path.exists(final):
         os.remove(final)
     _merge(final, workdir, n_chunks, pr.size)
+
+    # 走了第三方镜像 → 用 GitHub 官方 sha256 校验，防止镜像投毒/截断。
+    # 校验失败说明拿到的是错文件，绝不能留成正式名，也不能删掉证据。
+    if probed != url:
+        expect = _github_expected_digest(url, headers)
+        if expect:
+            print("校验 SHA-256（镜像下载，对照 GitHub 官方值）...")
+            actual = _sha256_file(final)
+            if actual != expect:
+                bad = final + ".bad"
+                try:
+                    os.replace(final, bad)
+                except OSError:
+                    bad = final
+                _cleanup_workdir(workdir)
+                raise DownloadError(
+                    f"镜像文件校验失败！期望 {expect[:16]}... 实际 {actual[:16]}...\n"
+                    f"损坏文件已改名为 {os.path.basename(bad)}，请重试或换节点。"
+                )
+            print("SHA-256 校验通过。")
+        else:
+            print("（未取到官方 sha256，跳过校验）")
+
     _cleanup_workdir(workdir)
     return 0
 
@@ -573,7 +855,7 @@ def download(url: str, dest_dir: str = ".", threads: int = 128, chunk_size: int 
              resume: bool = True, engine: str = "native", timeout: int = DEFAULT_TIMEOUT,
              stop: dict | None = None, headers: dict | None = None,
              proxy: str | None = None, limit_bps: float = 0.0,
-             source_ip: str | None = None) -> int:
+             source_ip: str | None = None, gh_accel: bool = True) -> int:
     """返回：0 成功，1 部分/可续传，2 失败。"""
     stop = stop or {"flag": False}
     os.makedirs(dest_dir, exist_ok=True)
@@ -587,4 +869,4 @@ def download(url: str, dest_dir: str = ".", threads: int = 128, chunk_size: int 
         raise DownloadError(f"不支持的协议: {url.split(':', 1)[0]}")
     return _download_native(url, dest_dir, threads, chunk_size, resume, timeout, stop,
                             headers=headers, proxy=proxy, limit_bps=limit_bps,
-                            source_ip=source_ip)
+                            source_ip=source_ip, gh_accel=gh_accel)
