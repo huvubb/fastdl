@@ -31,17 +31,20 @@ from .progress import SingleLineProgress
 from .utils import disk_free, sanitize_filename
 
 CHUNK_SIZE = 128 << 20 # 128 MiB（减少大型下载的请求轮换）
-MIN_CHUNK = 4 << 20    # 4 MiB（GitHub 等按单连接限速的 CDN，必须靠更多连接聚合带宽；
-                       #  每块仍 >=4MiB，请求数不失控，且分片请求可复用 keep-alive 连接）
+MIN_CHUNK = 2 << 20    # 2 MiB（Fastly/GitHub 等按单连接限速的 CDN，必须靠更多连接聚合带宽；
+                       #  每块仍 >=2MiB，请求数不失控，且分片请求可复用 keep-alive 连接）
 DEFAULT_TIMEOUT = 30
 MAX_CHUNK_RETRIES = 4      # 限制故障连接占用时间，失败后保留进度供续传
 MAX_CONNECT_RETRIES = 2    # 连接失败快速重试，避免多层退避叠加
 READ_TIMEOUT_CAP = 15        # 无数据时最多等 15 秒，及时释放卡住的 CDN 分片
 
 # ---------- curl 兜底 ----------
-# 下载速度归零时（CDN 偶发卡死、路由抖动），拉起系统 curl 以 Range 续传方式
-# 接手未完成的分片；fastdl 自身速度恢复后不立刻收队，给足宽限期再终止。
-CURL_STALL_TRIGGER = 10.0     # 聚合速度 < 1KB/s 持续 N 秒 → 拉起 curl 兜底
+# 下载速度过低时（CDN 单连接 QoS、偶发卡死、路由抖动），拉起系统 curl 以 Range
+# 续传方式接手未完成的分片，为主下载增加并行连接；fastdl 自身速度恢复后不立刻
+# 收队，给足宽限期再终止。
+CURL_ASSIST_RATE = 2 << 20    # 聚合速度低于 2MB/s 视为"速度过低"，可触发兜底
+CURL_ASSIST_TRIGGER = 10.0    # 速度过低持续 N 秒 → 拉起 curl 兜底
+CURL_RECOVER_RATE = 8 << 20   # fastdl 自身速度高于 8MB/s 视为"已恢复"
 CURL_RECOVER_GRACE = 15.0     # fastdl 自身速度恢复后，curl 再宽限 N 秒才终止
 CURL_MAX_CONCURRENT = 6       # 同时最多几个 curl 分片进程
 CURL_RESPAWN_COOLDOWN = 15.0  # 同一分片两次拉 curl 的最小间隔（防抖）
@@ -445,8 +448,14 @@ def _part_path(workdir: str, index: int) -> str:
 def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requests.Session,
                  resume: bool, timeout: int, progress, stop: dict,
                  workdir: str, dlmeta_path: str, headers: dict | None = None,
-                 limiter: RateLimiter | None = None) -> None:
-    """下载一个 chunk 到 .part.<index>；支持从已有大小续传。失败抛 DownloadError。"""
+                 limiter: RateLimiter | None = None,
+                 yield_flags: dict | None = None) -> None:
+    """下载一个 chunk 到 .part.<index>；支持从已有大小续传。失败抛 DownloadError。
+
+    yield_flags: 让位标志（index -> True）。curl 兜底接手前置位，worker 在每个
+    数据块写入前检查，置位后立即放弃该块（在途数据丢弃，不落盘），保证 curl
+    从快照偏移接管后不会与 worker 双写错位。
+    """
     start, end = _chunk_range(index, chunk_size, size)
     expect = end - start
     part_path = _part_path(workdir, index)
@@ -487,12 +496,16 @@ def _fetch_chunk(url: str, index: int, size: int, chunk_size: int, session: requ
             raise DownloadError(f"chunk {index} HTTP {r.status_code}")
         mode = "ab" if (resume and existing > 0) else "wb"
         got = 0
-        # 缓冲别太大：>块大小时进度不落盘，中断会丢掉整块的已完成数据
-        with open(part_path, mode, buffering=1 << 20) as f:
+        # buffering=0 直写：写入实时落盘，curl 兜底接管时快照偏移才真实可靠；
+        # 且让位/中断时缓冲区里不会残留待写数据，避免 close() 时补写出错位字节。
+        # 读取块取 64KB：让位标志的检查粒度 = 传输 64KB 的时间，慢速链路也能及时让位。
+        with open(part_path, mode, buffering=0) as f:
             # iter_content 会把底层的断流/解码异常抛出；不能把一次短读误判为 EOF。
-            for b in r.iter_content(chunk_size=4 << 20):
+            for b in r.iter_content(chunk_size=64 << 10):
                 if stop.get("flag"):
                     raise DownloadError("已停止")
+                if yield_flags is not None and yield_flags.get(index):
+                    raise DownloadError(f"chunk {index} 已让位给 curl")
                 if not b:
                     continue
                 f.write(b)
@@ -769,6 +782,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     curl_path = shutil.which("curl")
     curl_pool: dict[int, subprocess.Popen] = {}
     curl_owned: set[int] = set()
+    chunk_yield: dict[int, bool] = {}          # 让位标志：worker 写入前检查
     curl_bytes = [0]
     curl_cooldown: dict[int, float] = {}
     curl_state_lock = threading.Lock()
@@ -777,6 +791,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     fastdl_win: list[tuple[float, int]] = []   # (t, fastdl 自身累计字节) 滑动窗口
     last_progress = [time.monotonic()]         # 最近一次有实际进展的时刻
     last_done = [0]
+    curl_writer_threads: list[threading.Thread] = []
 
     def _part_size(i: int) -> int:
         p = _part_path(workdir, i)
@@ -787,6 +802,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             items = list(curl_pool.items())
             curl_pool.clear()
             curl_owned.clear()
+            chunk_yield.clear()
             grace_deadline[0] = None
         for _, p in items:
             try:
@@ -796,11 +812,20 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         # 写盘线程随管道 EOF 自然退出；terminate 前已写盘的数据留在 part 文件里可续传
 
     def _spawn_curl(i: int) -> bool:
-        """用 curl 接手分片 i：Range 从当前已写字节续传，stdout 由写盘线程落盘。"""
+        """用 curl 接手分片 i：先让 worker 让位，再从当前已写字节续传。
+
+        正确性关键：worker 在每个数据块写入前检查让位标志，因此置位之后
+        不会再有 worker 字节落盘，curl 从快照偏移接管不会双写错位。
+        """
         start, end = _chunk_range(i, chunk_size, pr.size)
         expect = end - start
+        if _part_size(i) >= expect:
+            return False
+        chunk_yield[i] = True
+        time.sleep(0.5)   # 给 worker 让位留一个检查周期
         existing = _part_size(i)
         if existing >= expect:
+            chunk_yield.pop(i, None)
             return False
         cmd = ["curl", "-sS", "-L", "--fail", "--connect-timeout", "10",
                "--speed-limit", "1024", "--speed-time", "30", "--retry", "2",
@@ -815,6 +840,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         except OSError:
             # 拉起失败也进冷却，避免监督循环 0.2s 一次疯狂重试
             curl_cooldown[i] = time.monotonic() + CURL_RESPAWN_COOLDOWN
+            chunk_yield.pop(i, None)
             return False
 
         def writer() -> None:
@@ -848,7 +874,9 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             except OSError:
                 pass
 
-        threading.Thread(target=writer, daemon=True).start()
+        wt = threading.Thread(target=writer, daemon=True)
+        wt.start()
+        curl_writer_threads.append(wt)
         now = time.monotonic()
         with curl_state_lock:
             curl_pool[i] = p
@@ -857,7 +885,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         return True
 
     def _curl_supervise() -> None:
-        """每 0.2s 巡检一次：速度归零拉 curl；fastdl 恢复后宽限再收队。"""
+        """每 0.2s 巡检一次：速度过低拉 curl 增加并行连接；fastdl 恢复后宽限再收队。"""
         if not curl_path:
             return   # 系统没有 curl，兜底机制整体禁用
         now = time.monotonic()
@@ -870,6 +898,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             with curl_state_lock:
                 curl_pool.pop(i, None)
                 curl_owned.discard(i)
+                chunk_yield.pop(i, None)
             start, end = _chunk_range(i, chunk_size, pr.size)
             sz = _part_size(i)
             if sz > (end - start):
@@ -895,25 +924,27 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         fastdl_rate = (fastdl_win[-1][1] - d0) / dt if dt > 0.2 else 0.0
         with curl_state_lock:
             n_curl = len(curl_pool)
-        # 3) 聚合速度归零持续 ≥ 触发阈值 且有可接手分片 → 拉 curl
+        # 3) 聚合速度过低持续 ≥ 触发阈值 且有可接手分片 → 拉 curl 增加并行连接。
+        #    显式限速（--limit）时速度低是用户意图，不触发兜底。
         pending = [i for i in range(n_chunks)
                    if i not in curl_owned
                    and _part_size(i) < (_chunk_range(i, chunk_size, pr.size)[1]
                                         - _chunk_range(i, chunk_size, pr.size)[0])
                    and curl_cooldown.get(i, 0) <= now]
-        if rate < 1024 and pending:
+        if rate < CURL_ASSIST_RATE and not limiter and pending:
             if stalled_since[0] is None:
                 stalled_since[0] = now
-            if now - stalled_since[0] >= CURL_STALL_TRIGGER and n_curl < CURL_MAX_CONCURRENT:
+            if now - stalled_since[0] >= CURL_ASSIST_TRIGGER and n_curl < CURL_MAX_CONCURRENT:
                 for i in pending[:CURL_MAX_CONCURRENT - n_curl]:
                     if _spawn_curl(i):
                         n_curl += 1
                         print(f"\ncurl 兜底: 分片 {i} 由 curl 接手"
-                              f"（速度归零 {CURL_STALL_TRIGGER:.0f}s）", flush=True)
+                              f"（速度 {rate / 1e6:.2f}MB/s 低于阈值，"
+                              f"持续 {CURL_ASSIST_TRIGGER:.0f}s）", flush=True)
         else:
             stalled_since[0] = None
         # 4) fastdl 自身速度恢复 → 不立刻收 curl，宽限 N 秒；期间再掉速则取消收队
-        if n_curl and fastdl_rate > (1 << 20):
+        if n_curl and fastdl_rate > CURL_RECOVER_RATE:
             if grace_deadline[0] is None:
                 grace_deadline[0] = now + CURL_RECOVER_GRACE
             elif now >= grace_deadline[0]:
@@ -944,10 +975,13 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             try:
                 _fetch_chunk(use, i, pr.size, chunk_size, session, resume, timeout,
                              progress, stop, workdir, dlmeta_path,
-                             headers=headers, limiter=limiter)
+                             headers=headers, limiter=limiter,
+                             yield_flags=chunk_yield)
                 return
             except DownloadError as e:
                 last = e
+                if "让位" in str(e):
+                    return   # curl 已接手，静默让位，不算失败
                 if attempt == 0:
                     print(f"\n分片 {i} 首次请求失败，快速重连: {e}", flush=True)
                 time.sleep(min(0.25 * (2 ** attempt), 1.0))
@@ -985,6 +1019,9 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         return 1
     finally:
         _stop_curls()
+        # 等所有 curl 写盘线程退出（管道 EOF 后很快），释放 part 文件锁再走合并/续传
+        for wt in list(curl_writer_threads):
+            wt.join(5.0)
         progress.finish("")
 
     def _part_done(i: int) -> bool:

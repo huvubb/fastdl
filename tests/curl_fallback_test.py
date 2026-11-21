@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""curl 兜底验证：对 python-requests UA 故意卡死（发 1MiB 后挂起），
-对其它 UA（curl）正常供数 → 只能靠 curl 兜底跑完整个下载。
+"""curl 兜底验证（低速触发）：服务器全局限速 ~1.2MB/s（低于 2MB/s 触发阈值），
+模拟 Fastly 等按连接 QoS 的慢 CDN。速度持续过低 10s 后应自动拉 curl 接手分片。
 
 跑：python tests/curl_fallback_test.py
 """
@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import os
 import random
-import socket
 import subprocess
 import sys
 import threading
@@ -20,14 +19,31 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(BASE, "tests", "curl_src.bin")
 OUT = os.path.join(BASE, "tests", "out")
 PORT = 13077
-SIZE = 20 << 20  # 20MB → 5 块 × 4MiB
+SIZE = 20 << 20  # 20MB → 10 块 × 2MiB
+
+# 全局令牌桶：所有连接共享 ~1.2MB/s 的出口带宽（低于 2MB/s 兜底阈值）
+_bucket_lock = threading.Lock()
+_bucket = [0.0]
+_bucket_last = [time.monotonic()]
+RATE = 1.2 * 1024 * 1024
+
+
+def _take_tokens(n: int) -> None:
+    while True:
+        with _bucket_lock:
+            now = time.monotonic()
+            _bucket[0] = min(RATE, _bucket[0] + (now - _bucket_last[0]) * RATE)
+            _bucket_last[0] = now
+            if _bucket[0] >= n:
+                _bucket[0] -= n
+                return
+        time.sleep(0.02)
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):
-        ua = self.headers.get("User-Agent", "")
         rng = self.headers.get("Range")
         size = os.path.getsize(SRC)
         if rng and rng.startswith("bytes="):
@@ -44,16 +60,11 @@ class Handler(BaseHTTPRequestHandler):
         with open(SRC, "rb") as f:
             f.seek(start)
             remaining = end - start
-            sent = 0
             while remaining > 0:
-                b = f.read(min(1 << 20, remaining))
+                b = f.read(min(64 << 10, remaining))
+                _take_tokens(len(b))
                 self.wfile.write(b)
-                sent += len(b)
                 remaining -= len(b)
-                # python-requests 的连接：先给 1MiB 再永久挂起（模拟 CDN 卡死）
-                if "python" in ua.lower() and sent >= (1 << 20):
-                    threading.Event().wait()   # 永久挂起
-                time.sleep(0.05)  # 全局限速，让 fastdl 也有点压力
 
     def log_message(self, *a):
         pass
@@ -97,7 +108,7 @@ def main() -> int:
 
     print(f"耗时 {dt:.1f}s  使用curl兜底: {used_curl}  大小/内容校验: {'PASS' if ok else 'FAIL'}")
     for line in out.splitlines():
-        if "curl" in line or "100.0%" in line or "分片" in line:
+        if "curl" in line or "分片" in line:
             print("  |", line.strip())
     return 0 if (ok and used_curl) else 1
 
