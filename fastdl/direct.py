@@ -15,7 +15,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket as _socket
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +37,14 @@ DEFAULT_TIMEOUT = 30
 MAX_CHUNK_RETRIES = 4      # 限制故障连接占用时间，失败后保留进度供续传
 MAX_CONNECT_RETRIES = 2    # 连接失败快速重试，避免多层退避叠加
 READ_TIMEOUT_CAP = 15        # 无数据时最多等 15 秒，及时释放卡住的 CDN 分片
+
+# ---------- curl 兜底 ----------
+# 下载速度归零时（CDN 偶发卡死、路由抖动），拉起系统 curl 以 Range 续传方式
+# 接手未完成的分片；fastdl 自身速度恢复后不立刻收队，给足宽限期再终止。
+CURL_STALL_TRIGGER = 10.0     # 聚合速度 < 1KB/s 持续 N 秒 → 拉起 curl 兜底
+CURL_RECOVER_GRACE = 15.0     # fastdl 自身速度恢复后，curl 再宽限 N 秒才终止
+CURL_MAX_CONCURRENT = 6       # 同时最多几个 curl 分片进程
+CURL_RESPAWN_COOLDOWN = 15.0  # 同一分片两次拉 curl 的最小间隔（防抖）
 
 # ---------- GitHub 直连加速 ----------
 # GitHub 直连国际链路常被 QoS（实测 0~4MB/s 随机抖动），纯多线程无解；
@@ -280,6 +290,20 @@ def _is_loopback_url(url: str) -> bool:
     return host in ("localhost", "::1") or host.startswith("127.")
 
 
+def _bind_ip_ok(ip: str) -> bool:
+    """验证源 IP 当前真能发起外连（WLAN 重连窗口期默认路由可能短暂变成
+    169.254.* APIPA 地址，绑定它会 10049；宁可放弃绑定也不能让下载全挂）。"""
+    try:
+        sk = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sk.settimeout(1.5)
+        sk.bind((ip, 0))
+        sk.connect(("223.5.5.5", 443))
+        sk.close()
+        return True
+    except OSError:
+        return False
+
+
 def _make_session(threads: int, source_ip: str | None = None,
                   proxy: str | None = None, auto_bind: bool = True) -> requests.Session:
     s = requests.Session()
@@ -296,6 +320,9 @@ def _make_session(threads: int, source_ip: str | None = None,
             bind_ip = None
     if bind_ip and proxy and _is_loopback(proxy):
         # 本地代理必须走回环：源地址绑到物理网卡会连不上（WinError 10049）
+        bind_ip = None
+    if bind_ip and not _bind_ip_ok(bind_ip):
+        # 源 IP 瞬态失效（APIPA/网卡切换）→ 放弃绑定，跟随系统默认路由
         bind_ip = None
     retry = _build_retry()
     pool_size = max(threads + 16, 256)
@@ -735,6 +762,168 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     progress = SingleLineProgress(pr.size, label=f"{fn} ")
     # 各线程速率暂不显示（聚合速率已覆盖），避免显示 0B/s
 
+    # ---------- curl 兜底监督器 ----------
+    # 状态全部收在闭包里：curl_pool(分片->进程)、curl_owned(curl 接手的分片集合)、
+    # curl_bytes(curl 累计写入字节，用于分离 fastdl 自身速率)、stalled_since(归零起点)、
+    # grace_deadline(速度恢复后的收队截止时刻)。
+    curl_path = shutil.which("curl")
+    curl_pool: dict[int, subprocess.Popen] = {}
+    curl_owned: set[int] = set()
+    curl_bytes = [0]
+    curl_cooldown: dict[int, float] = {}
+    curl_state_lock = threading.Lock()
+    stalled_since: list[float | None] = [None]
+    grace_deadline: list[float | None] = [None]
+    fastdl_win: list[tuple[float, int]] = []   # (t, fastdl 自身累计字节) 滑动窗口
+    last_progress = [time.monotonic()]         # 最近一次有实际进展的时刻
+    last_done = [0]
+
+    def _part_size(i: int) -> int:
+        p = _part_path(workdir, i)
+        return os.path.getsize(p) if os.path.exists(p) else 0
+
+    def _stop_curls() -> None:
+        with curl_state_lock:
+            items = list(curl_pool.items())
+            curl_pool.clear()
+            curl_owned.clear()
+            grace_deadline[0] = None
+        for _, p in items:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+        # 写盘线程随管道 EOF 自然退出；terminate 前已写盘的数据留在 part 文件里可续传
+
+    def _spawn_curl(i: int) -> bool:
+        """用 curl 接手分片 i：Range 从当前已写字节续传，stdout 由写盘线程落盘。"""
+        start, end = _chunk_range(i, chunk_size, pr.size)
+        expect = end - start
+        existing = _part_size(i)
+        if existing >= expect:
+            return False
+        cmd = ["curl", "-sS", "-L", "--fail", "--connect-timeout", "10",
+               "--speed-limit", "1024", "--speed-time", "30", "--retry", "2",
+               "-r", f"{start + existing}-{end - 1}",
+               "-H", "Accept-Encoding: identity"]
+        for k, v in (headers or {}).items():
+            cmd += ["-H", f"{k}: {v}"]
+        cmd.append(fetch_url)
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+        except OSError:
+            # 拉起失败也进冷却，避免监督循环 0.2s 一次疯狂重试
+            curl_cooldown[i] = time.monotonic() + CURL_RESPAWN_COOLDOWN
+            return False
+
+        def writer() -> None:
+            written = existing
+            try:
+                # buffering=0：terminate 时缓冲区里的字节不会丢
+                with open(_part_path(workdir, i), "ab", buffering=0) as f:
+                    while True:
+                        b = p.stdout.read(256 << 10)
+                        if not b:
+                            break
+                        if written + len(b) > expect:
+                            # 服务器无视 Range(200) 把整个文件灌下来了 → 数据错位，
+                            # 立即终止并删除该分片重下，绝不合并脏数据
+                            f.close()
+                            try:
+                                os.remove(_part_path(workdir, i))
+                            except OSError:
+                                pass
+                            try:
+                                p.terminate()
+                            except OSError:
+                                pass
+                            return
+                        f.write(b)
+                        written += len(b)
+                        curl_bytes[0] += len(b)
+                        if limiter:
+                            limiter.wait(len(b))
+                        progress.add(len(b), rate_key=f"c{i % 8}")
+            except OSError:
+                pass
+
+        threading.Thread(target=writer, daemon=True).start()
+        now = time.monotonic()
+        with curl_state_lock:
+            curl_pool[i] = p
+            curl_owned.add(i)
+            curl_cooldown[i] = now + CURL_RESPAWN_COOLDOWN
+        return True
+
+    def _curl_supervise() -> None:
+        """每 0.2s 巡检一次：速度归零拉 curl；fastdl 恢复后宽限再收队。"""
+        if not curl_path:
+            return   # 系统没有 curl，兜底机制整体禁用
+        now = time.monotonic()
+        # 1) 收尸：自然退出/死亡/完成的 curl
+        with curl_state_lock:
+            running = {i: p for i, p in curl_pool.items()}
+        for i, p in running.items():
+            if p.poll() is None:
+                continue
+            with curl_state_lock:
+                curl_pool.pop(i, None)
+                curl_owned.discard(i)
+            start, end = _chunk_range(i, chunk_size, pr.size)
+            sz = _part_size(i)
+            if sz > (end - start):
+                # 超量：数据错位（对端无视 Range），删掉重下
+                try:
+                    os.remove(_part_path(workdir, i))
+                except OSError:
+                    pass
+            elif sz >= (end - start):
+                print(f"\ncurl 兜底完成: 分片 {i}", flush=True)
+                last_progress[0] = now
+        # 2) 速度监测：聚合速率 vs fastdl 自身速率（3s 滑动窗口）
+        if progress.done > last_done[0]:
+            last_done[0] = progress.done
+            last_progress[0] = now
+        rate = progress.current_rate
+        fastdl_win.append((now, max(0, progress.done - curl_bytes[0])))
+        cutoff = now - 3.0
+        while len(fastdl_win) > 1 and fastdl_win[0][0] < cutoff:
+            fastdl_win.pop(0)
+        t0, d0 = fastdl_win[0]
+        dt = now - t0
+        fastdl_rate = (fastdl_win[-1][1] - d0) / dt if dt > 0.2 else 0.0
+        with curl_state_lock:
+            n_curl = len(curl_pool)
+        # 3) 聚合速度归零持续 ≥ 触发阈值 且有可接手分片 → 拉 curl
+        pending = [i for i in range(n_chunks)
+                   if i not in curl_owned
+                   and _part_size(i) < (_chunk_range(i, chunk_size, pr.size)[1]
+                                        - _chunk_range(i, chunk_size, pr.size)[0])
+                   and curl_cooldown.get(i, 0) <= now]
+        if rate < 1024 and pending:
+            if stalled_since[0] is None:
+                stalled_since[0] = now
+            if now - stalled_since[0] >= CURL_STALL_TRIGGER and n_curl < CURL_MAX_CONCURRENT:
+                for i in pending[:CURL_MAX_CONCURRENT - n_curl]:
+                    if _spawn_curl(i):
+                        n_curl += 1
+                        print(f"\ncurl 兜底: 分片 {i} 由 curl 接手"
+                              f"（速度归零 {CURL_STALL_TRIGGER:.0f}s）", flush=True)
+        else:
+            stalled_since[0] = None
+        # 4) fastdl 自身速度恢复 → 不立刻收 curl，宽限 N 秒；期间再掉速则取消收队
+        if n_curl and fastdl_rate > (1 << 20):
+            if grace_deadline[0] is None:
+                grace_deadline[0] = now + CURL_RECOVER_GRACE
+            elif now >= grace_deadline[0]:
+                print(f"\ncurl 收队: fastdl 速度已恢复"
+                      f"（{fastdl_rate / 1e6:.1f}MB/s），宽限 {CURL_RECOVER_GRACE:.0f}s 结束",
+                      flush=True)
+                _stop_curls()
+        elif n_curl:
+            grace_deadline[0] = None
+
     def worker(i):
         if stop.get("flag"):
             return
@@ -749,6 +938,8 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         for attempt in range(retries):
             if stop.get("flag"):
                 return
+            if i in curl_owned:
+                return   # curl 已接手该分片，fastdl 让位，避免双写同一 part 文件
             use = urls[min(attempt // 2, len(urls) - 1)]
             try:
                 _fetch_chunk(use, i, pr.size, chunk_size, session, resume, timeout,
@@ -770,10 +961,20 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             futs = [ex.submit(worker, i) for i in range(n_chunks)]
             while True:
                 progress.paint()
+                _curl_supervise()
                 if stop.get("flag"):
                     ex.shutdown(cancel_futures=True)
                     break
-                if all(f.done() for f in futs):
+                # workers 全退且 curl 也不再持有分片（全完成或全放弃）才结束；
+                # curl 死亡的分片若速度仍为零，监督器会在冷却后重新拉起
+                if all(f.done() for f in futs) and not curl_pool:
+                    break
+                # workers 已退但 curl 长时间无实际进展 → 停止兜底，按可续传收尾
+                if (all(f.done() for f in futs) and curl_pool
+                        and time.monotonic() - last_progress[0] > 120):
+                    print("\ncurl 兜底多次尝试无进展，停止兜底（进度已保留，可续传）",
+                          flush=True)
+                    _stop_curls()
                     break
                 time.sleep(0.2)
             for f in futs:
@@ -783,6 +984,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
         stop["flag"] = True
         return 1
     finally:
+        _stop_curls()
         progress.finish("")
 
     def _part_done(i: int) -> bool:
