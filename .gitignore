@@ -16,3 +16,4 @@ tests/enhance_src.bin
 
 # 发布辅助临时文件
 release_notes_*.md
+tests/curl_src.bin
