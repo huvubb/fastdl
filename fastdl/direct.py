@@ -22,7 +22,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -95,6 +95,76 @@ def _is_github_url(url: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return host in _GH_HOSTS
+
+
+# 签名 release-assets 直链所在主机（浏览器"复制下载链接"得到的就是它）
+_GH_ASSET_HOSTS = {"release-assets.githubusercontent.com",
+                   "objects.githubusercontent.com",
+                   "github-releases.githubusercontent.com"}
+
+
+def _dns_poisoned(url: str) -> bool:
+    """域名被本地 hosts/DNS 指向回环（127.0.0.1 / 0.0.0.0）→ 判定被拦截。
+
+    典型场景：本机 hosts 黑名单把 GitHub 域名全部指向 127.0.0.1，此时直连
+    必然 WinError 10049（绑着物理网卡源地址连回环）。镜像节点域名不在黑名单
+    里，不受影响——这是 DNS 拦截下的唯一自救通道。
+    """
+    if _is_loopback_url(url):
+        return False
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+        infos = _socket.getaddrinfo(host, 443, proto=_socket.IPPROTO_TCP)
+    except Exception:  # noqa: BLE001
+        return False
+    addrs = {i[4][0] for i in infos}
+    return bool(addrs) and all(a == "::1" or a.startswith(("127.", "0.")) for a in addrs)
+
+
+def _canonicalize_github_asset(url: str) -> str | None:
+    """签名 release-assets 直链 → 规范 github.com/releases/download/ URL。
+
+    签名 URL 有两个坑：多数镜像节点不代理该主机形态；签名约 1 小时过期，
+    长下载中途续传会 403。规范化后走统一加速链。
+    映射关系（repo id → 全名 → 资产名）通过镜像代理的 GitHub API 完成，
+    因为本机 api.github.com 可能同样被 hosts 拦截。
+    """
+    try:
+        sp = urlsplit(url)
+        host = (sp.hostname or "").lower()
+        if host not in _GH_ASSET_HOSTS or "github-production-release-asset" not in sp.path:
+            return None
+        parts = sp.path.strip("/").split("/")
+        repo_id = parts[1] if len(parts) > 1 else ""
+        q = parse_qs(sp.query)
+        disp = (q.get("response-content-disposition") or [""])[0]
+        m = re.search(r'filename="?([^";]+)"?', disp)
+        if not repo_id.isdigit() or not m:
+            return None
+        fname = unquote(m.group(1))
+        for prefix in _GH_MIRRORS:
+            try:
+                r = requests.get(f"{prefix}/https://api.github.com/repositories/{repo_id}",
+                                 headers={"Accept": "application/vnd.github+json",
+                                          "User-Agent": "fastdl"},
+                                 timeout=(3, 6))
+                full = r.json().get("full_name")
+                if not full:
+                    continue
+                r2 = requests.get(f"{prefix}/https://api.github.com/repos/{full}/releases",
+                                  params={"per_page": 100},
+                                  headers={"Accept": "application/vnd.github+json",
+                                           "User-Agent": "fastdl"},
+                                  timeout=(3, 10))
+                for rel in r2.json():
+                    for a in rel.get("assets", []):
+                        if a.get("name") == fname:
+                            return a["browser_download_url"]
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def _gh_cache_path() -> str:
@@ -421,6 +491,12 @@ def probe(url: str, threads: int = 16, timeout: int = DEFAULT_TIMEOUT,
           headers: dict | None = None, proxy: str | None = None,
           source_ip: str | None = None) -> ProbeResult:
     """权威探针：GET Range bytes=0-0。返回总长 + 是否支持分片 + 元数据。"""
+    if _dns_poisoned(url):
+        host = (urlsplit(url).hostname or "").lower()
+        raise DownloadError(
+            f"DNS 被本地拦截: {host} 解析到 127.0.0.1"
+            f"（hosts 黑名单或 DNS 缓存，Windows 检查 C:\\Windows\\System32\\drivers\\etc\\hosts）"
+        )
     s = _make_session(threads, source_ip=source_ip, proxy=proxy,
                       auto_bind=not _is_loopback_url(url))
     if proxy:
@@ -637,6 +713,17 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     session = _make_session(threads, source_ip=source_ip, proxy=proxy,
                             auto_bind=not _is_loopback_url(url))
     limiter = RateLimiter(limit_bps) if limit_bps > 0 else None
+    # 签名 release-assets 直链 → 规范 github.com URL：
+    # 镜像更友好、签名不过期（长下载中途续传不会 403）
+    canon = _canonicalize_github_asset(url)
+    if canon:
+        print(f"签名直链已规范化: {canon.rsplit('/', 2)[-2]}/{canon.rsplit('/', 1)[-1]}")
+        url = canon
+    # DNS 拦截检测：hosts 黑名单把 GitHub 域名指向 127.0.0.1 时直连必死（10049），
+    # 唯一自救通道是镜像（镜像域名不在黑名单里）
+    poisoned = _dns_poisoned(url)
+    if poisoned:
+        print("检测到 DNS 拦截（本机 hosts 把该域名指向 127.0.0.1），直连已跳过，走镜像候选链")
     # GitHub 直连加速：先竞速选镜像（并行 512KiB 探测，~1~4s），选中后探针也走镜像，
     # 彻底绕开直连链路的慢握手/重试；无合适节点则回退普通直连流程。
     # 候选链：正常情况下就是 [url]；开了加速则是 [镜像1, 镜像2, ..., 直连]
@@ -651,6 +738,10 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
                 chain, mbs = raced
                 print(f"GitHub 加速: 首选 {urlsplit(chain[0]).hostname}"
                       f"（探测 {mbs:.1f}MB/s，共 {len(chain)} 个候选可自动降级）")
+    if poisoned and not chain and _is_github_url(url):
+        # 竞速没选出候选（可能全慢）但直连已死 → 强制按默认顺序全试镜像
+        chain = [f"{m}/{url}" for m in _GH_MIRRORS]
+        print("竞速未选出快节点，按默认顺序尝试全部镜像...")
 
     # 探针沿候选链逐个尝试：某个镜像挂了自动换下一个，全挂才报错
     pr = None
@@ -666,12 +757,13 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
             if cand != url:
                 print(f"节点 {urlsplit(cand).hostname} 探针失败，换下一个...")
     if pr is None:
-        raise DownloadError(
-            f"探针失败: {probe_err}\n"
-            f"提示：境外站点（如 github）连接被重置/超时多为网络问题——"
-            f"可尝试 --proxy 指定可用代理，或稍后重试（镜像节点可能临时限流）；"
-            f"境内站点不受影响。"
-        )
+        hint = ("本机 DNS 把该域名指向 127.0.0.1（hosts 黑名单）且镜像候选全部不可用；"
+                "可检查拦截工具/hosts，或用 --proxy 指定代理"
+                if poisoned else
+                "境外站点（如 github）连接被重置/超时多为网络问题——"
+                "可尝试 --proxy 指定可用代理，或稍后重试（镜像节点可能临时限流）；"
+                "境内站点不受影响。")
+        raise DownloadError(f"探针失败: {probe_err}\n提示：{hint}")
 
     if probed != url:
         # 走镜像：用镜像前缀地址（镜像内部会处理跳转），不要直接打签名 CDN 直链
