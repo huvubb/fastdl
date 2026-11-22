@@ -233,6 +233,30 @@ def _build_retry():
         return Retry(method_whitelist=frozenset(["GET", "HEAD"]), **kw)
 
 
+def _resolve_curl() -> str | None:
+    """找一个真正能执行的 curl。
+
+    仅 shutil.which 不够：WSL 的 PATH 互操作会把 Windows 侧同名文件排进来
+    （DrvFS 上权限位全是合成值，which 视为可执行，Popen 直接 Exec format error）。
+    候选逐个试跑 --version，选第一个能跑的；都没有则禁用 curl 兜底。
+    """
+    cands = [shutil.which("curl"), "/usr/bin/curl", "/usr/local/bin/curl",
+             "/bin/curl", "/snap/bin/curl"]
+    tried: set[str] = set()
+    for c in cands:
+        if not c or c in tried:
+            continue
+        tried.add(c)
+        try:
+            r = subprocess.run([c, "--version"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=5)
+            if r.returncode == 0:
+                return c
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
 class RateLimiter:
     """跨线程共享的下载限速器（令牌桶）。limit<=0 表示不限速。
 
@@ -779,7 +803,7 @@ def _download_native(url: str, dest_dir: str, threads: int, chunk_size: int,
     # 状态全部收在闭包里：curl_pool(分片->进程)、curl_owned(curl 接手的分片集合)、
     # curl_bytes(curl 累计写入字节，用于分离 fastdl 自身速率)、stalled_since(归零起点)、
     # grace_deadline(速度恢复后的收队截止时刻)。
-    curl_path = shutil.which("curl")
+    curl_path = _resolve_curl()
     curl_pool: dict[int, subprocess.Popen] = {}
     curl_owned: set[int] = set()
     chunk_yield: dict[int, bool] = {}          # 让位标志：worker 写入前检查

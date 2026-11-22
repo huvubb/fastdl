@@ -9,6 +9,8 @@ import socket
 _VIRTUAL_HINTS = (
     "vmware", "vethernet", "hyper-v", "virtual", "tap", "tun", "wintun", "loopback",
     "bluetooth", "teredo", "isatap", "vpn", "clash", "mihomo", "虚拟", "蓝牙", "加速",
+    # Linux 常见虚拟接口
+    "docker", "veth", "virbr", "br-", "tailscale", "zerotier", "wg", "lxd",
 )
 
 

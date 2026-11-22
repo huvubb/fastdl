@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 import time
 
 
@@ -49,19 +50,32 @@ _RESERVED = {"con", "prn", "aux", "nul"}
 _RESERVED |= {f"com{i}" for i in range(1, 10)}
 _RESERVED |= {f"lpt{i}" for i in range(1, 10)}
 
+_WINDOWS = sys.platform == "win32"
+
 
 def sanitize_filename(name: str, fallback: str = "download") -> str:
-    """清洗 Windows 非法文件名：非法字符、结尾点/空格、保留名、超长名。"""
+    """清洗非法文件名。
+
+    Windows：非法字符、结尾点/空格、保留名、超长名（Linux 挂载 NTFS/暴露给
+    Windows 工具时同样受益）。POSIX：只替换路径分隔符和控制字符，
+    结尾点与保留名都是合法文件名，不做处理。
+    """
     name = (name or "").strip()
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
-    name = name.rstrip(". ")
-    if name.lower() in _RESERVED:
-        name = "_" + name
+    if _WINDOWS:
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    else:
+        name = re.sub(r"[/\x00-\x1f]", "_", name)
     if not name:
         return fallback
-    # 去掉 Windows 不能容忍的尾部（点在 Windows 上会丢失）
-    while name.endswith("."):
-        name = name[:-1]
+    if _WINDOWS:
+        name = name.rstrip(". ")
+        if name.lower() in _RESERVED:
+            name = "_" + name
+        if not name:
+            return fallback
+        # 去掉 Windows 不能容忍的尾部（点在 Windows 上会丢失）
+        while name.endswith("."):
+            name = name[:-1]
     if not name:
         return fallback
     return name[:200]

@@ -107,6 +107,11 @@ def main() -> int:
     ok = ok and actual_sha == expect_sha
 
     print(f"耗时 {dt:.1f}s  使用curl兜底: {used_curl}  大小/内容校验: {'PASS' if ok else 'FAIL'}")
+    print(f"dl.py 退出码: {r.returncode}")
+    print("---- dl.py 完整输出 ----")
+    print(out)
+    print("---- stderr ----")
+    print(r.stderr or "(空)")
     for line in out.splitlines():
         if "curl" in line or "分片" in line:
             print("  |", line.strip())
